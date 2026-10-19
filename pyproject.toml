@@ -20,10 +20,16 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pyinstaller>=6.6", "pillow>=10"]
+# MCP server for Claude and other AI assistants (always included in the packaged builds)
+mcp = ["mcp>=1.26,<2"]
+dev = ["sqliteview[mcp]", "pytest>=8", "pyinstaller>=6.6", "pillow>=10"]
 
 [project.gui-scripts]
 sqliteview = "sqliteview.app:main"
+
+# A console program: MCP clients talk to it over stdin/stdout, which GUI programs don't have on Windows
+[project.scripts]
+sqliteview-mcp = "sqliteview.mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/adibitz/SQLiteView"
