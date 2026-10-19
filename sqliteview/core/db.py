@@ -606,10 +606,15 @@ class DBBrowserDB(QObject):
         t = self.get_table_by_name(table)
         return t.rowid_columns() if t else []
 
-    def _rowid_where(self, pks: list[str]) -> str:
+    @staticmethod
+    def rowid_selector(pks: list[str]) -> str:
+        """SQL expression that addresses a record by ``pks`` (``_rowid_`` or the PRIMARY KEY columns)."""
         if len(pks) == 1:
-            return sqlb.escape_identifier(pks[0]) + "=?"
-        return "sqlb_make_single_value(" + ",".join(sqlb.escape_identifiers(pks)) + ")=?"
+            return sqlb.escape_identifier(pks[0])
+        return "sqlb_make_single_value(" + ",".join(sqlb.escape_identifiers(pks)) + ")"
+
+    def _rowid_where(self, pks: list[str]) -> str:
+        return self.rowid_selector(pks) + "=?"
 
     def get_row(self, table: sqlb.ObjectIdentifier, rowid: Any) -> Optional[list]:
         t = self.get_table_by_name(table)
@@ -691,10 +696,7 @@ class DBBrowserDB(QObject):
         if not pks:
             self.last_error = self.tr("Cannot delete this object")
             return False
-        if len(pks) == 1:
-            target = sqlb.escape_identifier(pks[0])
-        else:
-            target = "sqlb_make_single_value(" + ",".join(sqlb.escape_identifiers(pks)) + ")"
+        target = self.rowid_selector(pks)
         self.set_savepoint()
         with self.exclusive("deleting records") as conn:
             try:
