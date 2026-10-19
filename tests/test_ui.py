@@ -173,6 +173,26 @@ def test_export_csv_and_json(window, qapp, tmp_path, monkeypatch):
     assert len(data) == 40 and isinstance(data[0]["price"], float)
 
 
+def test_import_csv_dialog(window, qapp, tmp_path):
+    from sqliteview.ui.dialogs.import_csv import ImportCsvDialog
+    path = tmp_path / "visits.csv"
+    path.write_bytes(b"city;count\nPune;3\nDelhi;12\n")
+    dlg = ImportCsvDialog(window.db, [str(path)], window)
+    dlg.sep.setCurrentIndex(dlg.sep.findData(";"))
+    dlg.update_preview()
+    assert dlg.preview.columnCount() == 2 and dlg.preview.rowCount() == 2
+    dlg.accept()
+    assert dlg.imported_tables == ["visits"]
+    t = window.db.get_table_by_name(sqlb.ObjectIdentifier("main", "visits"))
+    assert [(f.name, f.type) for f in t.fields] == [("city", "TEXT"), ("count", "INTEGER")]
+    assert window.db.query_single_value("SELECT SUM(count) FROM visits") == 15
+    # importing the same file again appends to the existing table (the question is answered Yes)
+    dlg = ImportCsvDialog(window.db, [str(path)], window)
+    dlg.sep.setCurrentIndex(dlg.sep.findData(";"))
+    dlg.accept()
+    assert window.db.query_single_value("SELECT COUNT(*) FROM visits") == 4
+
+
 def test_drop_and_revert(window, qapp):
     window.open_table(sqlb.ObjectIdentifier("main", "orders"))
     window.drop_object("table", sqlb.ObjectIdentifier("main", "orders"))

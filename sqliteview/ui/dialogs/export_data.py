@@ -1,8 +1,8 @@
 """Export tables/views/query results to CSV or JSON. Port of upstream ``ExportDataDialog``."""
 from __future__ import annotations
 
-import json
 import os
+import sqlite3
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
 
 from ...core import sqlb
 from ...core.db import DBBrowserDB
-from ...core.rowexport import csv_field, json_value
+from ...core.rowexport import ExportCancelled, write_query_result
 from ...core.settings import Settings
 from ...core.table_model import SqliteTableModel
 from ..icons import icon
@@ -167,53 +167,23 @@ class ExportDataDialog(QDialog):
         super().accept()
 
     def _export(self, query: str, path: str, progress: QProgressDialog) -> bool:
-        import sqlite3
-        tmp = path + ".part"
-        with self.db.get("exporting data") as conn:
-            if conn is None:
-                return False
-            from ...core.db import _text_factory_fallback
-            conn.text_factory = _text_factory_fallback
-            try:
-                cur = self.db.run(conn, query)
-                names = [d[0] for d in cur.description or []]
-                n = 0
-                with open(tmp, "w", encoding="utf-8", newline="") as fh:
-                    if self.is_json:
-                        rows = []
-                        for r in cur:
-                            rows.append({k: json_value(v) for k, v in zip(names, r)})
-                            n += 1
-                            if n % 2000 == 0:
-                                QApplication.processEvents()
-                                if progress.wasCanceled():
-                                    raise _Cancel()
-                        json.dump(rows, fh, ensure_ascii=False, indent=4 if self.pretty.isChecked() else None)
-                    else:
-                        sep, quote, nl = self.sep.currentData(), self.quote.currentData(), self.newline.currentData()
-                        if self.header.isChecked():
-                            q = quote or ""
-                            fh.write(sep.join(f"{q}{c.replace(q, q + q) if q else c}{q}" for c in names) + nl)
-                        for r in cur:
-                            fh.write(sep.join(csv_field(v, sep, quote, nl) for v in r) + nl)
-                            n += 1
-                            if n % 5000 == 0:
-                                QApplication.processEvents()
-                                if progress.wasCanceled():
-                                    raise _Cancel()
-            except _Cancel:
-                os.remove(tmp)
-                return False
-            except sqlite3.Error as e:
-                self.db.last_error = str(e)
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                return False
-            finally:
-                conn.text_factory = str
-        os.replace(tmp, path)
+        def on_progress(_rows: int) -> bool:
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        if not self.db.is_open():
+            return False
+        try:
+            if self.is_json:
+                write_query_result(self.db, query, path, "json", pretty_json=self.pretty.isChecked(),
+                                   progress=on_progress)
+            else:
+                write_query_result(self.db, query, path, "csv", header=self.header.isChecked(),
+                                   sep=self.sep.currentData(), quote=self.quote.currentData(),
+                                   newline=self.newline.currentData(), progress=on_progress)
+        except ExportCancelled:
+            return False
+        except sqlite3.Error as e:
+            self.db.last_error = str(e)
+            return False
         return True
-
-
-class _Cancel(Exception):
-    pass

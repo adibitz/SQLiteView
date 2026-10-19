@@ -1,15 +1,10 @@
-"""Import CSV files into tables. Port of upstream ``ImportCsvDialog`` (+ ``CSVParser``).
-
-Parsing uses Python's C-implemented ``csv`` module; the insert path uses ``executemany`` on a
-single prepared statement inside a savepoint, the same strategy as the C++ code.
+"""Import CSV files into tables. Port of upstream ``ImportCsvDialog``; parsing, type detection
+and the insert path live in ``core/csvimport.py``.
 """
 from __future__ import annotations
 
 import csv
 import os
-import re
-import sqlite3
-from typing import Iterator, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -17,6 +12,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ...core import sqlb
+from ...core.csvimport import (CsvImportError, CsvOptions, ImportCancelled, detect_fields, empty_values_for,
+                               import_csv_file, read_preview)
 from ...core.db import DBBrowserDB
 from ...core.settings import Settings
 from ..icons import icon
@@ -25,37 +22,8 @@ from ..widgets import label
 SEPARATORS = [(",", ","), (";", ";"), ("Tab", "\t"), ("|", "|"), ("Space", " ")]
 QUOTES = [('"', '"'), ("'", "'"), ("None", "")]
 ENCODINGS = ["UTF-8", "UTF-16", "ISO-8859-1", "Windows-1252", "Windows-1251", "Shift_JIS", "GB18030", "Big5"]
-CONFLICT = [("Abort on conflict (default)", ""), ("Ignore conflicting rows", "OR IGNORE"), ("Replace conflicting rows", "OR REPLACE")]
-TYPE_DETECTION_ROWS = 20
-
-
-class _CountingFile:
-    """Wraps a text file to report how many characters have been consumed (for progress)."""
-
-    def __init__(self, fh):
-        self.fh = fh
-        self.consumed = 0
-
-    def __iter__(self) -> Iterator[str]:
-        for line in self.fh:
-            self.consumed += len(line)
-            yield line
-
-
-def _is_int(s: str) -> bool:
-    try:
-        int(s)
-        return True
-    except ValueError:
-        return False
-
-
-def _is_float(s: str) -> bool:
-    try:
-        float(s)
-        return True
-    except ValueError:
-        return False
+CONFLICT = [("Abort on conflict (default)", "abort"), ("Ignore conflicting rows", "ignore"),
+            ("Replace conflicting rows", "replace")]
 
 
 class ImportCsvDialog(QDialog):
@@ -194,85 +162,20 @@ class ImportCsvDialog(QDialog):
             return data
         return {"Tab": "\t", "\\t": "\t", "Space": " "}.get(txt, txt[:1] or ",")
 
-    def _encoding(self) -> str:
-        enc = self.encoding.currentText().strip() or "UTF-8"
-        return "utf-8-sig" if enc.upper() in ("UTF-8", "UTF8") else enc
-
-    def _reader(self, fh) -> Iterator[list[str]]:
-        quote = self.quote.currentData()
-        kwargs = dict(delimiter=self._separator(), doublequote=True, strict=False)
-        if quote:
-            kwargs.update(quotechar=quote, quoting=csv.QUOTE_MINIMAL)
-        else:
-            kwargs.update(quoting=csv.QUOTE_NONE, escapechar=None)
-        reader = csv.reader(fh, **kwargs)
-        trim = self.trim.isChecked()
-        for row in reader:
-            if not row:
-                continue
-            yield [c.strip() for c in row] if trim else row
-
-    def _field_list(self, path: str) -> list[sqlb.Field]:
-        """Port of ``generateFieldList``: names from the header, types from the first rows."""
-        fields: list[sqlb.Field] = []
-        with open(path, encoding=self._encoding(), newline="", errors="replace") as fh:
-            for row_num, row in enumerate(self._reader(fh)):
-                if row_num > TYPE_DETECTION_ROWS:
-                    break
-                for i in range(len(fields), len(row)):
-                    name = ""
-                    if row_num == 0 and self.header.isChecked():
-                        name = row[i]
-                        if self.sanitize.isChecked():
-                            name = re.sub(r"[^\w]", "_", name)
-                    if not name:
-                        name = f"field{i + 1}"
-                    # make names unique
-                    base, n = name, 1
-                    while any(f.name.lower() == name.lower() for f in fields):
-                        n += 1
-                        name = f"{base}_{n}"
-                    fields.append(sqlb.Field(name, ""))
-                if self.no_types.isChecked() or (row_num == 0 and self.header.isChecked()):
-                    continue
-                for i, content in enumerate(row):
-                    old = fields[i].type
-                    if old == "TEXT":
-                        continue
-                    if content == "":
-                        continue
-                    as_int, as_real = _is_int(content), _is_float(content)
-                    new = "TEXT"
-                    if old == "INTEGER" and not as_int and as_real:
-                        new = "REAL"
-                    elif not old and as_int:
-                        new = "INTEGER"
-                    elif not old and as_real:
-                        new = "REAL"
-                    elif old == "REAL" and as_real:
-                        new = "REAL"
-                    elif old == "INTEGER" and as_int:
-                        new = "INTEGER"
-                    fields[i].type = new
-        for f in fields:
-            if not f.type and not self.no_types.isChecked():
-                f.type = "TEXT"
-        return fields
+    def _options(self) -> CsvOptions:
+        return CsvOptions(separator=self._separator(), quote=self.quote.currentData(),
+                          encoding=self.encoding.currentText(), header=self.header.isChecked(),
+                          trim=self.trim.isChecked(), sanitize_names=self.sanitize.isChecked(),
+                          detect_types=not self.no_types.isChecked())
 
     # ------------------------------------------------------------------ preview
     def update_preview(self) -> None:
         path = self._current_file()
         self.error.setText("")
         try:
-            fields = self._field_list(path)
-            rows = []
-            with open(path, encoding=self._encoding(), newline="", errors="replace") as fh:
-                for i, row in enumerate(self._reader(fh)):
-                    if i == 0 and self.header.isChecked():
-                        continue
-                    rows.append(row)
-                    if len(rows) >= 100:
-                        break
+            opts = self._options()
+            fields = detect_fields(path, opts)
+            rows = read_preview(path, opts, 100)
         except (OSError, csv.Error, LookupError) as e:
             self.error.setText(f"Couldn't read the file: {e}")
             self.preview.clear()
@@ -323,13 +226,12 @@ class ImportCsvDialog(QDialog):
 
     def _import_file(self, path: str, table_name: str) -> bool:
         """Returns False to abort the whole import (error or cancel)."""
-        fields = self._field_list(path)
+        opts = self._options()
+        fields = detect_fields(path, opts)
         if not fields:
             return True
-        ident = sqlb.ObjectIdentifier("main", table_name)
-        tbl = self.db.get_table_by_name(ident)
-        to_existing = False
-        null_values: list = []
+        tbl = self.db.get_table_by_name(sqlb.ObjectIdentifier("main", table_name))
+        empty_values = None
         if tbl is not None:
             if len(tbl.fields) != len(fields):
                 QMessageBox.warning(self, "Import CSV", f"There is already a table named '{table_name}' and an import "
@@ -345,88 +247,27 @@ class ImportCsvDialog(QDialog):
                 if r == QMessageBox.Cancel:
                     return False
                 self._dont_ask.add("" if r == QMessageBox.YesToAll else table_name)
-            to_existing = True
-            for f in tbl.fields:
-                if not self.ignore_defaults.isChecked() and f.default_value:
-                    null_values.append(("default", f.default_value))
-                elif f.notnull:
-                    null_values.append(("value", 0 if f.is_integer() else ""))
-                else:
-                    null_values.append(("value", None))
+            empty_values = empty_values_for(self.db, tbl, use_defaults=not self.ignore_defaults.isChecked())
 
-        savepoint = self.db.generate_savepoint_name("csvimport")
-        if not self.db.set_savepoint(savepoint):
-            QMessageBox.warning(self, "Import CSV", f"Creating restore point failed: {self.db.last_error}")
-            return False
-        if not to_existing and not self.db.create_table(ident, fields):
-            self.db.revert_to_savepoint(savepoint)
-            QMessageBox.warning(self, "Import CSV", f"Creating the table failed: {self.db.last_error}")
-            return False
-        self._dont_ask.add(table_name)
-        if to_existing:
-            # defaults have to be evaluated by SQLite, so pre-compute them
-            resolved = []
-            for kind, v in null_values:
-                if kind == "default":
-                    resolved.append(self.db.query_single_value(f"SELECT {v}", log=False))
-                else:
-                    resolved.append(v)
-            null_values = resolved
-        n = len(fields)
-        sql = f"INSERT {self.conflict.currentData()} INTO {sqlb.escape_identifier(table_name)} VALUES({','.join('?' * n)})"
-        total = max(1, os.path.getsize(path))
         progress = QProgressDialog(f"Importing {os.path.basename(path)}…", "Cancel", 0, 1000, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(300)
-        has_header = self.header.isChecked()
-        rows_done = 0
+
+        def on_progress(permille: int) -> bool:
+            progress.setValue(permille)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
         try:
-            with open(path, encoding=self._encoding(), newline="", errors="replace") as raw, \
-                    self.db.get("importing CSV") as conn:
-                fh = _CountingFile(raw)
-                reader = self._reader(fh)
-                if has_header:
-                    next(reader, None)
-                batch: list[list] = []
-
-                def flush() -> None:
-                    conn.executemany(sql, batch)
-                    batch.clear()
-
-                for row in reader:
-                    if len(row) < n:
-                        row = row + [""] * (n - len(row))
-                    elif len(row) > n:
-                        row = row[:n]
-                    if to_existing:
-                        vals = [null_values[i] if v == "" else v for i, v in enumerate(row)]
-                    else:
-                        vals = [None if v == "" else v for v in row]
-                    batch.append(vals)
-                    if len(batch) >= 5000:
-                        flush()
-                        rows_done += 5000
-                        progress.setValue(int(fh.consumed * 1000 / total))
-                        QApplication.processEvents()
-                        if progress.wasCanceled():
-                            raise _Cancel()
-                if batch:
-                    rows_done += len(batch)
-                    flush()
-        except _Cancel:
-            progress.close()
-            self.db.revert_to_savepoint(savepoint)
+            import_csv_file(self.db, path, table_name, opts, fields, to_existing=tbl is not None,
+                            conflict=self.conflict.currentData(), empty_values=empty_values, progress=on_progress)
+        except ImportCancelled:
             return False
-        except (sqlite3.Error, csv.Error, OSError, UnicodeError) as e:
-            progress.close()
-            self.db.revert_to_savepoint(savepoint)
-            QMessageBox.warning(self, "Import CSV", f"Inserting row failed (around row {rows_done + 1}):\n{e}")
+        except CsvImportError as e:
+            QMessageBox.warning(self, "Import CSV", str(e))
             return False
-        progress.close()
-        self.db.log_sql(f"-- Imported {os.path.basename(path)} into {table_name}\n{sql}")
+        finally:
+            progress.close()
+        self._dont_ask.add(table_name)
         self.imported_tables.append(table_name)
         return True
-
-
-class _Cancel(Exception):
-    pass
