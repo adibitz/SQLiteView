@@ -1,6 +1,7 @@
 """Persistent settings with the upstream defaults (port of ``src/Settings.{h,cpp}``)."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ from PySide6.QtCore import QSettings
 
 ORG_NAME = "sqliteview"
 APP_NAME = "sqliteview"
+SETTINGS_ENV = "SQLITEVIEW_SETTINGS"
 
 DEFAULTS: dict[tuple[str, str], Any] = {
     ("db", "defaultencoding"): "UTF-8",
@@ -61,6 +63,9 @@ DEFAULTS: dict[tuple[str, str], Any] = {
     ("extensions", "list"): [],
     ("extensions", "disableregex"): False,
     ("extensions", "enable_load_extension"): False,
+    ("mcp", "live_enabled"): False,  # Tools › Allow AI Assistants (restored at start)
+    ("mcp", "live_port"): 47652,  # 127.0.0.1 port of the live MCP server; sqliteview-mcp --live reads it
+    ("mcp", "live_token"): "",  # bearer token of the live server, created on first use
     ("MainWindow", "geometry"): None,
     ("MainWindow", "windowState"): None,
 }
@@ -73,7 +78,10 @@ class Settings:
     @classmethod
     def _store(cls) -> QSettings:
         if cls._qs is None:
-            cls._qs = QSettings(ORG_NAME, APP_NAME)
+            # SETTINGS_ENV names an INI file to use instead (portable setups, build checks, tests of the
+            # sqliteview-mcp --live bridge, which must find the same port and token as the app)
+            path = os.environ.get(SETTINGS_ENV)
+            cls._qs = QSettings(path, QSettings.IniFormat) if path else QSettings(ORG_NAME, APP_NAME)
         return cls._qs
 
     @classmethod
@@ -97,6 +105,17 @@ class Settings:
     def set(cls, group: str, name: str, value: Any) -> None:
         cls._cache[(group, name)] = value
         cls._store().setValue(f"{group}/{name}", value)
+
+    @classmethod
+    def sync(cls) -> None:
+        """Write pending changes now (for values another process reads, like the live MCP port and token)."""
+        cls._store().sync()
+
+    @classmethod
+    def reload(cls) -> None:
+        """Forget cached values and re-read the store (picks up what another process wrote)."""
+        cls._store().sync()
+        cls._cache.clear()
 
     @classmethod
     def reset(cls) -> None:
