@@ -262,3 +262,29 @@ class Banner(QFrame):
         lay.addWidget(self.text, 1)
         self.buttons = QHBoxLayout()
         lay.addLayout(self.buttons)
+
+
+class IntField(QLineEdit):
+    """Compact integer input (QSpinBox look-alike without spin buttons, which eat space in narrow fields)."""
+
+    def __init__(self, minimum: int = 1, maximum: int = 1, parent=None):
+        super().__init__(parent)
+        from PySide6.QtGui import QIntValidator
+        self._validator = QIntValidator(minimum, maximum, self)
+        self.setValidator(self._validator)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText(str(minimum))
+
+    def setRange(self, minimum: int, maximum: int) -> None:  # noqa: N802 - mirrors QSpinBox
+        self._validator.setRange(minimum, min(maximum, 2**31 - 1))
+        if self.text() and not (minimum <= self.value() <= maximum):
+            self.setValue(max(minimum, min(self.value(), maximum)))
+
+    def value(self) -> int:
+        try:
+            return int(self.text())
+        except ValueError:
+            return self._validator.bottom()
+
+    def setValue(self, v: int) -> None:  # noqa: N802 - mirrors QSpinBox
+        self.setText(str(int(v)))

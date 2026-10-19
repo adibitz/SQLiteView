@@ -1,19 +1,18 @@
 """Export tables/views/query results to CSV or JSON. Port of upstream ``ExportDataDialog``."""
 from __future__ import annotations
 
-import base64
 import json
 import os
 from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-                               QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QProgressDialog,
+                               QHBoxLayout, QListWidget, QListWidgetItem, QMessageBox, QProgressDialog,
                                QVBoxLayout, QWidget)
 
 from ...core import sqlb
-from ...core.data import is_binary, value_to_text
 from ...core.db import DBBrowserDB
+from ...core.rowexport import csv_field, json_value
 from ...core.settings import Settings
 from ...core.table_model import SqliteTableModel
 from ..icons import icon
@@ -22,26 +21,6 @@ from ..widgets import SegmentedControl, label
 SEPARATORS = [(",", ","), (";", ";"), ("Tab", "\t"), ("|", "|")]
 QUOTES = [('"', '"'), ("'", "'"), ("None", "")]
 NEWLINES = [("Windows (CRLF)", "\r\n"), ("Unix (LF)", "\n")]
-
-
-def csv_field(v, sep: str, quote: str, newline: str) -> str:
-    """CSV quoting rules from upstream: base64 for binary, quote when special chars occur."""
-    if v is None:
-        return ""
-    if isinstance(v, (bytes, bytearray)) and is_binary(v):
-        return base64.b64encode(bytes(v)).decode("ascii")
-    s = value_to_text(v)
-    if not quote and newline in s:
-        return '"' + s.replace('"', '""') + '"'
-    if quote and any(ch in s for ch in (newline, sep, quote, "\n", "\r")):
-        return quote + s.replace(quote, quote + quote) + quote
-    return s
-
-
-def json_value(v):
-    if isinstance(v, (bytes, bytearray)):
-        return base64.b64encode(bytes(v)).decode("ascii")
-    return v
 
 
 class ExportDataDialog(QDialog):

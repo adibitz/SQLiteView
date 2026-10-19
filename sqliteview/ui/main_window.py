@@ -823,6 +823,7 @@ class MainWindow(QMainWindow):
         tab.foreignKeyJump.connect(self._follow_foreign_key)
         tab.modifyRequested.connect(self.edit_table)
         tab.exportRequested.connect(lambda ident_: self.export_data("csv", ident_))
+        tab.exportViewRequested.connect(lambda model: self.export_data("csv", model=model))
         tab.insertDialogRequested.connect(self.add_record_dialog)
         tab.statusMessage.connect(self.notify)
         tab.fullScreenRequested.connect(self._set_full_screen)

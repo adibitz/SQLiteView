@@ -5,6 +5,7 @@ views hide it. Rows are fetched by ``RowLoader`` in chunks of ``db/prefetchsize`
 """
 from __future__ import annotations
 
+import math
 import threading
 from enum import IntEnum
 from typing import Any, Optional
@@ -60,6 +61,7 @@ class SqliteTableModel(QAbstractTableModel):
     finishedFetch = Signal(int, int)
     finishedRowCount = Signal()
     errorOccurred = Signal(str)
+    pagingChanged = Signal()
 
     colors = CellColors()
 
@@ -77,6 +79,10 @@ class SqliteTableModel(QAbstractTableModel):
         self._table: Optional[sqlb.Table] = None
         self._static = False
         self.last_error = ""
+        # Pagination: page size 0 means one continuous, lazily loaded list (upstream behaviour)
+        self._page_size = 0
+        self._page = 0
+        self._pending_page: Optional[int] = None
         # Conditional formats by column name, so they survive refreshes and schema reloads
         self._cond_formats: dict[str, list[CondFormat]] = {}
         self._matcher = CondFormatMatcher()
@@ -113,14 +119,21 @@ class SqliteTableModel(QAbstractTableModel):
     def _handle_finished_fetch(self, life: int, begin: int, end: int) -> None:
         if life < self._life:
             return
-        old = self._current_row_count
-        new = max(old, begin, end)
-        if new != old:
-            self.beginInsertRows(QModelIndex(), old, new - 1)
-            self._current_row_count = new
-            self.endInsertRows()
+        old_abs = self._current_row_count
+        new_abs = max(old_abs, begin, end)
+        if new_abs != old_abs:
+            old_view, new_view = self.rowCount(), self._view_count(new_abs)
+            if new_view > old_view:
+                self.beginInsertRows(QModelIndex(), old_view, new_view - 1)
+                self._current_row_count = new_abs
+                self.endInsertRows()
+            else:
+                self._current_row_count = new_abs
         if end != begin and self._headers:
-            self.dataChanged.emit(self.index(begin, 0), self.index(end - 1, len(self._headers) - 1))
+            off = self.row_offset()
+            vb, ve = max(begin - off, 0), min(end - off, self.rowCount())
+            if ve > vb:
+                self.dataChanged.emit(self.index(vb, 0), self.index(ve - 1, len(self._headers) - 1))
         if self._row_count_available != RowCount.Complete:
             self._row_count_available = RowCount.Partial
         self.finishedFetch.emit(begin, end)
@@ -132,7 +145,11 @@ class SqliteTableModel(QAbstractTableModel):
         n = min(n, self.rows_limit)
         self._row_count_available = RowCount.Complete
         self._handle_finished_fetch(life, n, n)
+        if self._pending_page is not None:
+            page, self._pending_page = self._pending_page, None
+            self.set_page(page)
         self.finishedRowCount.emit()
+        self.pagingChanged.emit()
 
     def _handle_error(self, life: int, msg: str) -> None:
         if life < self._life:
@@ -177,11 +194,32 @@ class SqliteTableModel(QAbstractTableModel):
         if end != begin:
             self._worker.trigger_fetch(self._life, begin, end)
 
+    def _load_range(self, begin: int, end: int) -> None:
+        """Fetch the absolute rows [begin, end) unless they're cached already."""
+        if self._static:
+            return
+        if self._row_count_available == RowCount.Complete:
+            end = min(end, self._current_row_count)
+        with self._cache_lock:
+            begin, end = self._cache.smallest_non_available_range(begin, end)
+        if end > begin:
+            self._worker.trigger_fetch(self._life, begin, end)
+
+    def _load_view(self) -> None:
+        if self._page_size:
+            self._load_range(self.row_offset(), self.row_offset() + self._page_size)
+
     def complete_cache(self, progress=None) -> bool:
-        """Load all rows into the cache (needed for copy/export of a full selection)."""
+        """Load all rows of the view into the cache (needed for copy/export of a full selection)."""
         if self._static:
             return True
         self.wait_until_idle()
+        if self._page_size:
+            self._load_view()
+            self._worker.wait_until_idle()
+            from PySide6.QtCore import QCoreApplication
+            QCoreApplication.processEvents()
+            return True
         i = 0
         while i < self.rowCount() + self.chunk_size // 2:
             if progress is not None and not progress(i, self.rowCount()):
@@ -194,8 +232,65 @@ class SqliteTableModel(QAbstractTableModel):
         return True
 
     def is_cache_complete(self) -> bool:
+        off = self.row_offset()
         with self._cache_lock:
-            return len(self._cache.rows) >= self.rowCount()
+            return all((off + r) in self._cache for r in range(self.rowCount()))
+
+    # ------------------------------------------------------------------ pagination
+    @property
+    def page_size(self) -> int:
+        return self._page_size
+
+    @property
+    def page(self) -> int:
+        return self._page
+
+    def row_offset(self) -> int:
+        """Absolute row number of the first row shown (0 without pagination)."""
+        return self._page * self._page_size if self._page_size else 0
+
+    def _view_count(self, abs_count: Optional[int] = None) -> int:
+        n = self._current_row_count if abs_count is None else abs_count
+        if not self._page_size:
+            return n
+        return max(0, min(self._page_size, n - self.row_offset()))
+
+    def total_rows(self) -> int:
+        """All rows of the (filtered) query, as far as known."""
+        return self._real_row_count if self._row_count_available == RowCount.Complete else self._current_row_count
+
+    def page_count(self) -> int:
+        if not self._page_size:
+            return 1
+        return max(1, math.ceil(self.total_rows() / self._page_size))
+
+    def set_page_size(self, size: int) -> None:
+        """Rows per page; 0 shows every row in one scrolling list. Keeps the first visible row in view."""
+        size = max(0, int(size))
+        if size == self._page_size:
+            return
+        first = self.row_offset()
+        self.beginResetModel()
+        self._page_size = size
+        self._page = first // size if size else 0
+        self.endResetModel()
+        self._load_view()
+        self.pagingChanged.emit()
+
+    def set_page(self, page: int) -> None:
+        if not self._page_size:
+            return
+        if self._row_count_available != RowCount.Complete and page > 0 and page * self._page_size >= self._current_row_count:
+            self._pending_page = page  # apply once the row count is known
+            return
+        page = max(0, min(int(page), self.page_count() - 1))
+        if page == self._page:
+            return
+        self.beginResetModel()
+        self._page = page
+        self.endResetModel()
+        self._load_view()
+        self.pagingChanged.emit()
 
     # ------------------------------------------------------------------ query setup
     def reset(self) -> None:
@@ -285,11 +380,14 @@ class SqliteTableModel(QAbstractTableModel):
                     return []
 
     def _update_and_run_query(self) -> None:
+        self._page = 0
+        self._pending_page = None
         self._clear_cache()
         self._s_query = self._query.build_query(True)
         self._worker.set_query(self._s_query, self._query.build_count_query())
         self.trigger_cache_load(self.chunk_size // 2 - 1)
         self.layoutChanged.emit()
+        self.pagingChanged.emit()
 
     def refresh(self) -> None:
         if self._static:
@@ -328,7 +426,7 @@ class SqliteTableModel(QAbstractTableModel):
             return -1
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else self._current_row_count
+        return 0 if parent.isValid() else self._view_count()
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._headers)
@@ -338,25 +436,25 @@ class SqliteTableModel(QAbstractTableModel):
 
     def raw_value(self, row: int, column: int) -> Any:
         with self._cache_lock:
-            r = self._cache.get(row)
+            r = self._cache.get(row + self.row_offset())
         if r is None or column >= len(r):
             return None
         return r[column]
 
     def row_available(self, row: int) -> bool:
         with self._cache_lock:
-            return row in self._cache
+            return (row + self.row_offset()) in self._cache
 
     def row_values(self, row: int) -> Optional[list]:
         with self._cache_lock:
-            r = self._cache.get(row)
+            r = self._cache.get(row + self.row_offset())
         return list(r) if r is not None else None
 
     # ------------------------------------------------------------------ header
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
         if orientation == Qt.Vertical:
             if role == Qt.DisplayRole:
-                return str(section + 1)
+                return str(self.row_offset() + section + 1)
             return None
         if section >= len(self._headers):
             return None
@@ -409,16 +507,19 @@ class SqliteTableModel(QAbstractTableModel):
 
     # ------------------------------------------------------------------ data
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
-        if not index.isValid() or index.row() >= self._current_row_count:
+        if not index.isValid() or index.row() >= self.rowCount():
             return None
         row, col = index.row(), index.column()
         with self._cache_lock:
-            r = self._cache.get(row)
+            r = self._cache.get(row + self.row_offset())
         available = r is not None
         value = r[col] if available and col < len(r) else None
         if not available and role in (Qt.DisplayRole, Qt.EditRole, Qt.DecorationRole):
             # Load lazily when the view asks for a missing row
-            self.trigger_cache_load(row)
+            if self._page_size:
+                self._load_view()
+            else:
+                self.trigger_cache_load(row)
 
         if role == Qt.DisplayRole:
             if not available:
@@ -551,7 +652,7 @@ class SqliteTableModel(QAbstractTableModel):
             return False
         row, col = index.row(), index.column()
         with self._cache_lock:
-            cached = self._cache.get(row)
+            cached = self._cache.get(row + self.row_offset())
         if cached is None:
             return False
         new_value = self.convert_for_column(col, value, is_blob)
@@ -593,6 +694,18 @@ class SqliteTableModel(QAbstractTableModel):
             new_rows.append([rowid] + list(data))
         if not new_rows:
             return False
+        if self._page_size:
+            # Append at the end of the table and show the last page, where the new record lives
+            self.beginResetModel()
+            with self._cache_lock:
+                for i, r in enumerate(new_rows):
+                    self._cache.set(self._current_row_count + i, r)
+            self._current_row_count += len(new_rows)
+            self._real_row_count += len(new_rows)
+            self._page = max(0, (self._current_row_count - 1) // self._page_size)
+            self.endResetModel()
+            self.pagingChanged.emit()
+            return True
         self.beginInsertRows(parent, row, row + len(new_rows) - 1)
         with self._cache_lock:
             for i, r in enumerate(new_rows):
@@ -608,13 +721,26 @@ class SqliteTableModel(QAbstractTableModel):
     def remove_row_list(self, rows: list[int]) -> bool:
         if not self.is_editable() or self.reading_data() or not rows:
             return False
+        off = self.row_offset()
         with self._cache_lock:
-            rowids = [self._cache.get(r)[0] for r in rows if r in self._cache]
+            rowids = [self._cache.get(off + r)[0] for r in rows if (off + r) in self._cache]
         self.db.set_undo_savepoint()
         if not self.db.delete_records(self._query.table, rowids, self._query.rowid_columns):
             self.last_error = self.db.last_error
             self.errorOccurred.emit(self.tr("Error deleting record:\n%1").replace("%1", self.db.last_error))
             return False
+        if self._page_size:
+            self.beginResetModel()
+            with self._cache_lock:
+                for r in sorted(rows, reverse=True):
+                    self._cache.erase(off + r)
+            self._current_row_count -= len(rows)
+            self._real_row_count -= len(rows)
+            self._page = min(self._page, max(0, (max(self._current_row_count, 1) - 1) // self._page_size))
+            self.endResetModel()
+            self._load_view()
+            self.pagingChanged.emit()
+            return True
         for r in sorted(rows, reverse=True):
             self.beginRemoveRows(QModelIndex(), r, r)
             with self._cache_lock:

@@ -158,6 +158,9 @@ class DataGrid(QTableView):
     deleteRowsRequested = Signal()
     duplicateRowRequested = Signal()
     insertRowRequested = Signal()
+    rowDetailsRequested = Signal(int)
+    exportSelectionRequested = Signal()
+    selectionSummaryChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -185,12 +188,16 @@ class DataGrid(QTableView):
         self.filter_header.sortRequested.connect(self._sort_requested)
         self.filter_header.setContextMenuPolicy(Qt.CustomContextMenu)
         self.filter_header.customContextMenuRequested.connect(self._header_context_menu)
+        vh.sectionDoubleClicked.connect(self.rowDetailsRequested)
+        vh.setToolTip("Click to select rows (Ctrl/Shift for several) · double-click for row details")
         self._model: Optional[SqliteTableModel] = None
 
     # ------------------------------------------------------------------ model
     def set_table_model(self, model: SqliteTableModel) -> None:
         self._model = model
         self.setModel(model)
+        self.selectionModel().selectionChanged.connect(lambda *_: self.selectionSummaryChanged.emit())
+        model.modelReset.connect(self.selectionSummaryChanged)
         model.modelReset.connect(self._after_reset)
         model.layoutChanged.connect(self._after_reset)
         self._after_reset()
@@ -414,8 +421,19 @@ class DataGrid(QTableView):
         a.triggered.connect(lambda: self.copy())
         menu.addAction(icon("copy"), "Copy with Headers", lambda: self.copy(with_headers=True))
         menu.addAction(icon("file-code"), "Copy as SQL INSERT", lambda: self.copy(as_sql=True))
+        from ..core.rowexport import ROW_FORMATS
+        rows_menu = menu.addMenu(icon("list"), "Copy Selected Rows As")
+        for key, text in ROW_FORMATS.items():
+            rows_menu.addAction(text, lambda k=key: self.copy_rows_as(k))
+        rows_menu.setEnabled(bool(self.selectedIndexes()))
         a = menu.addAction(icon("clipboard"), "Paste", self.paste)
         a.setEnabled(editable)
+        menu.addSeparator()
+        menu.addAction(icon("check"), "Select All", self.selectAll)
+        a = menu.addAction(icon("list"), "View Row Details…", lambda: self.rowDetailsRequested.emit(idx.row()))
+        a.setEnabled(idx.isValid())
+        a = menu.addAction(icon("download"), "Export Selected Rows…", self.exportSelectionRequested.emit)
+        a.setEnabled(bool(self.selectedIndexes()))
         menu.addSeparator()
         if idx.isValid():
             v = m.raw_value(idx.row(), idx.column())
@@ -448,6 +466,34 @@ class DataGrid(QTableView):
         name = m.column_name(col)
         menu = QMenu(self)
         if self.has_rowid_column():
+            current = next((o for o in m.query.order_by if o.expr == name), None)
+            menu.addAction(icon("arrow-up"), "Sort Ascending", lambda: self.sort_column(col, SortDirection.Ascending))
+            menu.addAction(icon("arrow-down"), "Sort Descending", lambda: self.sort_column(col, SortDirection.Descending))
+            others = [o for o in m.query.order_by if o.expr != name]
+            if others:
+                menu.addAction(icon("plus"), "Then Sort Ascending",
+                               lambda: self.sort_column(col, SortDirection.Ascending, additive=True))
+                menu.addAction(icon("plus"), "Then Sort Descending",
+                               lambda: self.sort_column(col, SortDirection.Descending, additive=True))
+            a = menu.addAction(icon("x"), "Remove From Sort", lambda: m.sort_by([o for o in m.query.order_by if o.expr != name]))
+            a.setEnabled(current is not None)
+            a = menu.addAction(icon("x"), "Clear All Sorting", lambda: m.sort_by([]))
+            a.setEnabled(bool(m.query.order_by))
+            menu.addSeparator()
+            menu.addAction(icon("filter"), "Filter…", lambda: self.open_filter_builder(col))
+            a = menu.addAction(icon("filter-x"), "Clear Filter", lambda: self.filter_header.set_filter(col, ""))
+            a.setEnabled(bool(self.filter_header.filter_text(col)))
+            menu.addSeparator()
+        a = menu.addAction(icon("view"), "Hide Column", lambda: self.setColumnHidden(col, True))
+        a.setEnabled(len(self.visible_columns()) > 1)
+        hidden = [c for c in range(1 if self.has_rowid_column() else 0, m.columnCount()) if self.isColumnHidden(c)]
+        a = menu.addAction(icon("column"), f"Show All Columns ({len(hidden)} hidden)" if hidden else "Show All Columns",
+                           lambda: [self.setColumnHidden(c, False) for c in hidden])
+        a.setEnabled(bool(hidden))
+        menu.addAction(icon("wrap"), "Fit Column Width", lambda: self.resizeColumnToContents(col))
+        menu.addAction(icon("copy"), "Copy Column Name", lambda: QGuiApplication.clipboard().setText(name))
+        menu.addSeparator()
+        if self.has_rowid_column():
             menu.addAction(icon("format"), "Display Format…", lambda: self.edit_display_format(col))
             a = menu.addAction(icon("x"), "Reset Display Format", lambda: m.set_display_format(col, ""))
             a.setEnabled(m.has_display_format(col))
@@ -456,6 +502,24 @@ class DataGrid(QTableView):
         a = menu.addAction(icon("x"), "Clear Conditional Formats", lambda: m.set_cond_formats(name, []))
         a.setEnabled(bool(m.cond_formats(name)))
         menu.exec(self.filter_header.mapToGlobal(pos))
+
+    def sort_column(self, column: int, direction: SortDirection, additive: bool = False) -> None:
+        m = self._model
+        if m is None or column <= 0 or m.query.table.is_empty():
+            return
+        name = m.column_name(column)
+        order = [o for o in m.query.order_by if o.expr != name] if additive else []
+        m.sort_by(order + [OrderBy(name, direction)])
+
+    def open_filter_builder(self, column: int) -> None:
+        from .dialogs.filter_builder import FilterBuilderDialog
+        m = self._model
+        if m is None:
+            return
+        cols = [(c, m.column_name(c)) for c in self.visible_columns() if c > 0 or not self.has_rowid_column()]
+        dlg = FilterBuilderDialog(cols, column, self.filter_header.filter_text(column), m.filter_escape, self)
+        if dlg.exec():
+            self.filter_header.set_filter(dlg.selected_column(), dlg.filter_text())
 
     def edit_display_format(self, column: int) -> None:
         from .dialogs.display_format import DisplayFormatDialog
@@ -478,6 +542,62 @@ class DataGrid(QTableView):
 
     def selected_rows(self) -> list[int]:
         return sorted({i.row() for i in self.selectedIndexes()})
+
+    def set_row_selection(self, on: bool) -> None:
+        """Select whole rows (True) or individual cells (False)."""
+        self.setSelectionBehavior(QAbstractItemView.SelectRows if on else QAbstractItemView.SelectItems)
+        cur = self.currentIndex()
+        if on and cur.isValid():
+            self.selectRow(cur.row())
+
+    def row_selection(self) -> bool:
+        return self.selectionBehavior() == QAbstractItemView.SelectRows
+
+    def visible_columns(self) -> list[int]:
+        m = self._model
+        if m is None:
+            return []
+        cols = [c for c in range(m.columnCount()) if not self.isColumnHidden(c)]
+        return sorted(cols, key=lambda c: self.horizontalHeader().visualIndex(c))
+
+    def selection_summary(self) -> tuple[int, int]:
+        """(selected rows, selected cells) counting only visible columns."""
+        idx = [i for i in self.selectedIndexes() if not self.isColumnHidden(i.column())]
+        return len({i.row() for i in idx}), len(idx)
+
+    def selected_rows_data(self) -> tuple[list[str], list[list]]:
+        """Column names and full rows (all visible columns) for every row that has a selected cell."""
+        m = self._model
+        rows = self.selected_rows()
+        if m is None or not rows or not self._ensure_loaded(rows):
+            return [], []
+        cols = self.visible_columns()
+        data = []
+        for r in rows:
+            values = m.row_values(r) or []
+            data.append([values[c] if c < len(values) else None for c in cols])
+        return [m.column_name(c) for c in cols], data
+
+    def view_rows_data(self) -> tuple[list[str], list[list]]:
+        """Every row currently shown (the current page, or all rows without pagination)."""
+        m = self._model
+        if m is None:
+            return [], []
+        rows = list(range(m.rowCount()))
+        if not self._ensure_loaded(rows):
+            return [], []
+        cols = self.visible_columns()
+        return [m.column_name(c) for c in cols], [[(m.row_values(r) or [None] * m.columnCount())[c] for c in cols]
+                                                  for r in rows]
+
+    def copy_rows_as(self, fmt: str) -> None:
+        from ..core.rowexport import format_rows
+        names, rows = self.selected_rows_data()
+        if not rows:
+            return
+        m = self._model
+        table = m.query.table.name if m is not None and not m.query.table.is_empty() else "table"
+        QGuiApplication.clipboard().setText(format_rows(fmt, names, rows, table, sep="\t" if fmt == "tsv" else ","))
 
     def select_cell(self, row: int, column: int) -> None:
         if self._model is None:

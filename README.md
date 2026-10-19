@@ -30,6 +30,11 @@ python main.py work.sqbpro          # open a project (database, tabs, filters, l
 | Qt default look | DM Sans interface font (bundled, SIL Open Font License — see `sqliteview/assets/fonts/OFL.txt`); light and dark themes with design tokens (follows the OS by default, Ctrl+Shift+L to toggle), comfortable/compact density, crisp vector icons. |
 | Plot dock (QCustomPlot) | **Plot** panel (Qt Charts) that follows the current table or SQL result: X column or row number, up to eight numeric Y columns as lines, scatter or bars, themed series colours, hover values, zoom, save as image. |
 | Display format / conditional format dialogs | Right-click a column header: **Display Format…** (presets for dates, hex, case, JSON … or your own SQL expression, validated inline) and **Conditional Formats…** (ordered rules in the filter syntax, with live colour preview; text stays legible when only a background is set). |
+| Endless scrolling only | **Pagination** (50 – 5,000 rows per page, or “All” for one scrolling list), page navigation, “Showing 101–200 of 20,000”, go to any row. |
+| Filter row | Filter row plus a **filter builder** (column › condition › value, e.g. between, starts with, is NULL), and removable chips for every active filter, search and sort. |
+| Click header to sort | Header right-click menu: sort ascending/descending, add a secondary sort, clear sorting, filter, hide/show columns, fit width. |
+| Cell selection | **Multi-select** cells or whole rows (toolbar toggle, Ctrl/Shift-click, Ctrl+A); a selection bar shows the count with copy (CSV, TSV, JSON, SQL, Markdown), export, set NULL and delete. Double-click a row number for **row details**. |
+| Export whole tables | Export the whole table, the filtered & sorted rows, the current page, or just the selected rows (CSV, JSON, SQL INSERT, Markdown, TSV). |
 | — | Full-screen grid: the expand button on a table or on query results (or F11) hides everything else; Esc restores the layout. |
 | — | Start page with recent files, drag & drop (.db opens, .csv imports, .sql opens in an editor), toasts for non-blocking feedback. |
 

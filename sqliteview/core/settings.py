@@ -48,6 +48,7 @@ DEFAULTS: dict[tuple[str, str], Any] = {
     ("databrowser", "blob_text"): "BLOB",
     ("databrowser", "filter_escape"): "\\",
     ("databrowser", "filter_delay"): 200,
+    ("databrowser", "page_size"): 100,  # rows per page in table tabs; 0 = one scrolling list
     ("databrowser", "cell_word_wrap"): True,
     ("editor", "font"): "",  # "" = best available monospace font
     ("editor", "fontsize"): 10,

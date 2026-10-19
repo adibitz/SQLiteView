@@ -182,6 +182,10 @@ QToolButton[kind="primary"]:disabled {{ background: {t.sunken}; color: {t.text_f
 QToolButton[kind="warn"] {{ background: {t.warning_soft}; color: {t.warning}; font-weight: 600; }}
 QToolButton[kind="warn"]:hover {{ border-color: {t.warning}; }}
 QToolButton::menu-indicator {{ image: none; width: 0; }}
+QToolButton[kind="chip"] {{ background: {t.accent_soft}; color: {t.accent}; border-radius: 11px; padding: 2px 10px; font-size: 8.5pt; }}
+QToolButton[kind="chip"]:hover {{ border-color: {t.accent}; }}
+QFrame[role="chipsbar"] {{ background: {t.surface}; border-bottom: 1px solid {t.border}; }}
+QFrame[role="selectionbar"] {{ background: {t.accent_soft}; border-radius: 8px; }}
 
 /* segmented control */
 QFrame[role="segmented"] {{ background: {t.sunken}; border-radius: 7px; padding: 2px; }}

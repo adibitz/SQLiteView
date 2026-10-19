@@ -16,7 +16,9 @@ SHORTCUTS = [
                     ("Find / replace", "Ctrl+F"), ("Indent / outdent", "Tab / Shift+Tab")]),
     ("Data grid", [("Copy", "Ctrl+C"), ("Copy with headers", "Ctrl+Shift+C"), ("Paste", "Ctrl+V"), ("Set to NULL", "Delete"),
                    ("Edit cell", "F2 or type"), ("Edit in inspector", "Ctrl+Enter"), ("Refresh", "F5"),
-                   ("Sort by several columns", "Ctrl+click header"), ("Follow foreign key", "Ctrl+Shift+click")]),
+                   ("Sort by several columns", "Ctrl+click header"), ("Follow foreign key", "Ctrl+Shift+click"),
+                   ("Select all", "Ctrl+A"), ("Previous / next page", "Alt+Left / Alt+Right"),
+                   ("Row details", "Double-click row number"), ("Sort, filter, hide columns", "Right-click header")]),
     ("Inspector", [("Apply changes", "Ctrl+Enter")]),
 ]
 
