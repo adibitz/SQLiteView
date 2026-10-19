@@ -1,6 +1,8 @@
 # PyInstaller spec for SQliteView. Build with:  python scripts/build.py
 # (or directly:  pyinstaller --noconfirm packaging/sqliteview.spec)
-# Produces dist/SQliteView/ (Windows, Linux) or dist/SQliteView.app (macOS).
+# Produces dist/SQliteView/ (Windows, Linux) or dist/SQliteView.app (macOS) with two programs that share
+# one set of libraries: SQliteView (the window app) and sqliteview-mcp (the console MCP server that AI
+# assistants start; it needs real stdin/stdout, which a windowed program doesn't have on Windows).
 import os
 import re
 import sys
@@ -45,7 +47,35 @@ exe = EXE(  # noqa: F821
     upx=False,
 )
 
-coll = COLLECT(exe, a.binaries, a.datas, name="SQliteView", upx=False)  # noqa: F821
+# The MCP server never imports widgets, nor these packages that the MCP SDK's dependencies only reference
+# optionally (HTTP transports, auth, plugins); leaving them out keeps ~70 MB out of the bundle.
+# The Qt libraries themselves are shared with the app through COLLECT below.
+MCP_EXCLUDES = EXCLUDES + [
+    "PySide6.QtWidgets", "PySide6.QtGui", "PySide6.QtSvg", "PySide6.QtCharts",
+    "numpy", "PIL", "setuptools", "pkg_resources", "yaml", "psutil", "simplejson", "tomli", "websockets",
+    "cryptography", "jwt",
+]
+a_mcp = Analysis(  # noqa: F821
+    [os.path.join(ROOT, "mcp_main.py")],
+    pathex=[ROOT],
+    hiddenimports=["anyio._backends._asyncio"],  # anyio loads its event-loop backend by name
+    excludes=MCP_EXCLUDES,
+    noarchive=False,
+)
+exe_mcp = EXE(  # noqa: F821
+    PYZ(a_mcp.pure),  # noqa: F821
+    a_mcp.scripts,
+    [],
+    exclude_binaries=True,
+    name="sqliteview-mcp",
+    console=True,
+    icon=os.path.join(ICONS, "sqliteview.icns" if sys.platform == "darwin" else "sqliteview.ico"),
+    upx=False,
+)
+
+# COLLECT drops duplicate entries, so both programs share one _internal folder
+coll = COLLECT(exe, exe_mcp, a.binaries + a_mcp.binaries, a.datas + a_mcp.datas,  # noqa: F821
+               name="SQliteView", upx=False)
 
 if sys.platform == "darwin":
     app = BUNDLE(  # noqa: F821

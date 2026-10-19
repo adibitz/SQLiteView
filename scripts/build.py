@@ -13,6 +13,7 @@ PyInstaller can't cross-compile: run this on each target OS (CI does it, see .gi
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -21,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -29,6 +31,7 @@ BUILD = os.path.join(ROOT, "build")
 SPEC = os.path.join(ROOT, "packaging", "sqliteview.spec")
 ICONS = os.path.join(ROOT, "sqliteview", "assets", "icons")
 APP_NAME = "SQliteView"
+MCP_NAME = "sqliteview-mcp"  # console MCP server bundled next to the app (see packaging/sqliteview.spec)
 
 
 def version() -> str:
@@ -49,6 +52,44 @@ def run(cmd: list[str], **kw) -> None:
 
 def bundle() -> None:
     run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", DIST, "--workpath", BUILD, SPEC])
+
+
+def mcp_executable() -> str:
+    if sys.platform == "darwin":
+        return os.path.join(DIST, f"{APP_NAME}.app", "Contents", "MacOS", MCP_NAME)
+    return os.path.join(DIST, APP_NAME, MCP_NAME + (".exe" if sys.platform == "win32" else ""))
+
+
+def check_mcp_server() -> None:
+    """Start the bundled MCP server like an AI client would and fail the build unless it answers.
+    Catches modules PyInstaller missed and anything that writes non-protocol output to stdout."""
+    exe = mcp_executable()
+    with tempfile.TemporaryDirectory() as folder:
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": {"name": "build-check", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "open_database", "arguments": {"path": "check.db", "create": True}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+             "params": {"name": "run_query", "arguments": {"sql": "SELECT sqlite_version()"}}},
+        ]
+        print("+", exe, "--root", folder, flush=True)
+        proc = subprocess.run([exe, "--root", folder], input="".join(json.dumps(r) + "\n" for r in requests).encode(),
+                              capture_output=True, timeout=120)
+    try:
+        replies = {r["id"]: r for r in (json.loads(line) for line in proc.stdout.decode("utf-8").splitlines()
+                                         if line.strip())}
+        tools = len(replies[2]["result"]["tools"])
+        version_rows = replies[4]["result"]["structuredContent"]["rows"]
+        if replies[3]["result"].get("isError") or replies[4]["result"].get("isError"):
+            raise KeyError("tool call failed")
+    except (ValueError, KeyError, TypeError) as e:
+        sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+        raise SystemExit(f"{MCP_NAME} self-check failed ({e!r}). stdout was:\n{proc.stdout[:2000]!r}")
+    print(f"{MCP_NAME} OK: {tools} tools, SQLite {version_rows[0][0]}")
 
 
 def zip_dir(src: str, dest_zip: str, root_name: str) -> None:
@@ -119,7 +160,10 @@ def package_linux(ver: str) -> list[str]:
     shutil.copy(os.path.join(ICONS, "sqliteview.png"), appdir)
     apprun = os.path.join(appdir, "AppRun")
     with open(apprun, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write('#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/lib/sqliteview/SQliteView" "$@"\n')
+        # An AppImage has one entry point: "SQliteView.AppImage mcp …" starts the MCP server instead of the app
+        fh.write('#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
+                 f'if [ "$1" = "mcp" ]; then shift; exec "$HERE/usr/lib/sqliteview/{MCP_NAME}" "$@"; fi\n'
+                 'exec "$HERE/usr/lib/sqliteview/SQliteView" "$@"\n')
     os.chmod(apprun, os.stat(apprun).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     image = os.path.join(DIST, f"{APP_NAME}-{ver}-linux-{arch()}.AppImage")
     env = dict(os.environ, ARCH=platform.machine())
@@ -134,6 +178,7 @@ def main() -> int:
     ver = version()
     if not args.skip_bundle:
         bundle()
+    check_mcp_server()
     if sys.platform == "win32":
         files = package_windows(ver)
     elif sys.platform == "darwin":
