@@ -18,11 +18,14 @@ import os
 import platform
 import re
 import shutil
+import socket
+import sqlite3
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -54,42 +57,84 @@ def bundle() -> None:
     run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", DIST, "--workpath", BUILD, SPEC])
 
 
-def mcp_executable() -> str:
+def bundled_program(name: str) -> str:
+    """Path of one of the two programs in the bundle (APP_NAME or MCP_NAME)."""
     if sys.platform == "darwin":
-        return os.path.join(DIST, f"{APP_NAME}.app", "Contents", "MacOS", MCP_NAME)
-    return os.path.join(DIST, APP_NAME, MCP_NAME + (".exe" if sys.platform == "win32" else ""))
+        return os.path.join(DIST, f"{APP_NAME}.app", "Contents", "MacOS", name)
+    return os.path.join(DIST, APP_NAME, name + (".exe" if sys.platform == "win32" else ""))
+
+
+HANDSHAKE = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+     "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "build-check", "version": "1"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+]
+
+
+def mcp_exchange(args: list[str], calls: list[tuple[str, dict]], env: dict | None = None) -> tuple[int, list]:
+    """Talk to the bundled sqliteview-mcp like an AI client: handshake, tool list, then ``calls``.
+    Returns (number of tools, the structured result of each call); exits the build on any failure."""
+    exe = bundled_program(MCP_NAME)
+    requests = HANDSHAKE + [{"jsonrpc": "2.0", "id": 3 + i, "method": "tools/call",
+                             "params": {"name": name, "arguments": arguments}} for i, (name, arguments) in enumerate(calls)]
+    print("+", exe, *args, flush=True)
+    proc = subprocess.run([exe, *args], input="".join(json.dumps(r) + "\n" for r in requests).encode(),
+                          capture_output=True, timeout=120, env=env)
+    try:
+        replies = {r["id"]: r for r in (json.loads(line) for line in proc.stdout.decode("utf-8").splitlines()
+                                         if line.strip())}
+        results = [replies[3 + i]["result"] for i in range(len(calls))]
+        if any(r.get("isError") for r in results):
+            raise KeyError("tool call failed")
+        return len(replies[2]["result"]["tools"]), [r["structuredContent"] for r in results]
+    except (ValueError, KeyError, TypeError) as e:
+        sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+        raise SystemExit(f"{MCP_NAME} self-check failed ({e!r}). stdout was:\n{proc.stdout[:2000]!r}")
 
 
 def check_mcp_server() -> None:
     """Start the bundled MCP server like an AI client would and fail the build unless it answers.
     Catches modules PyInstaller missed and anything that writes non-protocol output to stdout."""
-    exe = mcp_executable()
     with tempfile.TemporaryDirectory() as folder:
-        requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                        "clientInfo": {"name": "build-check", "version": "1"}}},
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-             "params": {"name": "open_database", "arguments": {"path": "check.db", "create": True}}},
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-             "params": {"name": "run_query", "arguments": {"sql": "SELECT sqlite_version()"}}},
-        ]
-        print("+", exe, "--root", folder, flush=True)
-        proc = subprocess.run([exe, "--root", folder], input="".join(json.dumps(r) + "\n" for r in requests).encode(),
-                              capture_output=True, timeout=120)
-    try:
-        replies = {r["id"]: r for r in (json.loads(line) for line in proc.stdout.decode("utf-8").splitlines()
-                                         if line.strip())}
-        tools = len(replies[2]["result"]["tools"])
-        version_rows = replies[4]["result"]["structuredContent"]["rows"]
-        if replies[3]["result"].get("isError") or replies[4]["result"].get("isError"):
-            raise KeyError("tool call failed")
-    except (ValueError, KeyError, TypeError) as e:
-        sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
-        raise SystemExit(f"{MCP_NAME} self-check failed ({e!r}). stdout was:\n{proc.stdout[:2000]!r}")
-    print(f"{MCP_NAME} OK: {tools} tools, SQLite {version_rows[0][0]}")
+        tools, (_, version) = mcp_exchange(["--root", folder], [("open_database", {"path": "check.db", "create": True}),
+                                                                ("run_query", {"sql": "SELECT sqlite_version()"})])
+    print(f"{MCP_NAME} OK: {tools} tools, SQLite {version['rows'][0][0]}")
+
+
+def check_live_mode() -> None:
+    """Start the bundled app headless with Allow AI Assistants on (in a throw-away settings file) and query its
+    database through the bundled sqliteview-mcp --live bridge."""
+    with tempfile.TemporaryDirectory() as folder:
+        db = os.path.join(folder, "live.db")
+        con = sqlite3.connect(db)
+        con.executescript("CREATE TABLE t(a); INSERT INTO t VALUES (1), (2);")
+        con.close()
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        ini = os.path.join(folder, "settings.ini")
+        with open(ini, "w", encoding="utf-8") as fh:
+            fh.write(f"[mcp]\nlive_enabled=true\nlive_port={port}\nlive_token=build-check-{os.getpid()}\n")
+        env = dict(os.environ, SQLITEVIEW_SETTINGS=ini, QT_QPA_PLATFORM="offscreen")
+        app = subprocess.Popen([bundled_program(APP_NAME), db], env=env)
+        try:
+            deadline = time.monotonic() + 60
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                    break
+                except OSError:
+                    if app.poll() is not None or time.monotonic() > deadline:
+                        raise SystemExit(f"{APP_NAME} didn't start serving AI assistants on port {port}")
+                    time.sleep(0.3)
+            tools, (result,) = mcp_exchange(["--live"], [("run_query", {"sql": "SELECT SUM(a) FROM t"})], env)
+        finally:
+            app.terminate()
+            app.wait(30)
+    if result["rows"] != [[3]]:
+        raise SystemExit(f"live mode returned {result['rows']!r}")
+    print(f"{APP_NAME} live mode OK: {tools} tools through {MCP_NAME} --live")
 
 
 def zip_dir(src: str, dest_zip: str, root_name: str) -> None:
@@ -179,6 +224,7 @@ def main() -> int:
     if not args.skip_bundle:
         bundle()
     check_mcp_server()
+    check_live_mode()
     if sys.platform == "win32":
         files = package_windows(ver)
     elif sys.platform == "darwin":

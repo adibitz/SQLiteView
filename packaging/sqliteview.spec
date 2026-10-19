@@ -25,13 +25,20 @@ EXCLUDES = [
     "PySide6.QtDataVisualization", "PySide6.QtGraphs", "PySide6.QtRemoteObjects", "PySide6.QtScxml",
     "PySide6.QtSpatialAudio", "PySide6.QtTextToSpeech", "PySide6.QtHttpServer",
 ]
+# Packages the MCP SDK's dependencies only reference optionally (other transports, auth, plugins); neither the
+# app (live mode) nor the console server needs them, and leaving them out keeps ~70 MB out of the bundle.
+UNUSED_BY_MCP = [
+    "numpy", "PIL", "setuptools", "pkg_resources", "yaml", "psutil", "simplejson", "tomli", "websockets",
+    "cryptography", "jwt",
+]
+MCP_HIDDENIMPORTS = ["anyio._backends._asyncio"]  # anyio loads its event-loop backend by name
 
 a = Analysis(  # noqa: F821
     [os.path.join(ROOT, "main.py")],
     pathex=[ROOT],
     datas=[(os.path.join(ROOT, "sqliteview", "assets"), os.path.join("sqliteview", "assets"))],
-    hiddenimports=["PySide6.QtSvg", "PySide6.QtCharts"],
-    excludes=EXCLUDES,
+    hiddenimports=["PySide6.QtSvg", "PySide6.QtCharts"] + MCP_HIDDENIMPORTS,  # the app hosts live mode
+    excludes=EXCLUDES + UNUSED_BY_MCP,
     noarchive=False,
 )
 pyz = PYZ(a.pure)  # noqa: F821
@@ -47,19 +54,13 @@ exe = EXE(  # noqa: F821
     upx=False,
 )
 
-# The MCP server never imports widgets, nor these packages that the MCP SDK's dependencies only reference
-# optionally (HTTP transports, auth, plugins); leaving them out keeps ~70 MB out of the bundle.
-# The Qt libraries themselves are shared with the app through COLLECT below.
-MCP_EXCLUDES = EXCLUDES + [
-    "PySide6.QtWidgets", "PySide6.QtGui", "PySide6.QtSvg", "PySide6.QtCharts",
-    "numpy", "PIL", "setuptools", "pkg_resources", "yaml", "psutil", "simplejson", "tomli", "websockets",
-    "cryptography", "jwt",
-]
+# The console server never imports widgets; the Qt libraries themselves are shared with the app through
+# COLLECT below.
 a_mcp = Analysis(  # noqa: F821
     [os.path.join(ROOT, "mcp_main.py")],
     pathex=[ROOT],
-    hiddenimports=["anyio._backends._asyncio"],  # anyio loads its event-loop backend by name
-    excludes=MCP_EXCLUDES,
+    hiddenimports=MCP_HIDDENIMPORTS,
+    excludes=EXCLUDES + UNUSED_BY_MCP + ["PySide6.QtWidgets", "PySide6.QtGui", "PySide6.QtSvg", "PySide6.QtCharts"],
     noarchive=False,
 )
 exe_mcp = EXE(  # noqa: F821
