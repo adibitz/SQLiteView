@@ -27,7 +27,7 @@ from PySide6.QtCore import QObject, QThread, QCoreApplication, Signal
 from . import parser, sqlb
 from .data import value_to_text
 from .settings import Settings
-from .sqlsplit import iter_statements
+from .sqlsplit import is_transaction_control, iter_statements
 
 TrackColumns = list[tuple[Optional[str], Optional[str]]]
 
@@ -259,7 +259,11 @@ class DBBrowserDB(QObject):
             conn.create_function("REGEXP", 2, _sql_regexp, deterministic=True)
         conn.create_function("sqlb_make_single_value", -1, _sql_make_single_value, deterministic=True)
 
-    def open(self, path: str, read_only: bool = False) -> bool:
+    def open(self, path: str, read_only: bool = False, load_extensions: bool = True,
+             run_default_sql: bool = True) -> bool:
+        """Open ``path``. ``load_extensions`` / ``run_default_sql`` apply the user's extension list and
+        "SQL to execute after opening" from the settings (off for the MCP server, which must not hand
+        extension functions such as file access to an AI assistant)."""
         if self.is_open() and not self.close(force=True):
             return False
         self.encrypted = False
@@ -284,9 +288,10 @@ class DBBrowserDB(QObject):
             ap = os.path.abspath(path)
             self.read_only = read_only or not os.access(ap, os.W_OK) or not os.access(os.path.dirname(ap), os.W_OK)
 
-        self.load_extensions_from_settings()
+        if load_extensions:
+            self.load_extensions_from_settings()
 
-        if not self.read_only:
+        if not self.read_only and run_default_sql:
             default_sql = Settings.get("db", "defaultsqltext")
             if default_sql:
                 self.execute_multi_sql(default_sql, dirty=False, log=True)
@@ -295,7 +300,7 @@ class DBBrowserDB(QObject):
         self.update_schema()
         return True
 
-    def create(self, path: str) -> bool:
+    def create(self, path: str, load_extensions: bool = True, run_default_sql: bool = True) -> bool:
         if self.is_open() and not self.close(force=True):
             return False
         try:
@@ -310,7 +315,7 @@ class DBBrowserDB(QObject):
         except sqlite3.Error as e:
             self.last_error = str(e)
             return False
-        return self.open(path)
+        return self.open(path, load_extensions=load_extensions, run_default_sql=run_default_sql)
 
     def close(self, force: bool = False) -> bool:
         """Close the database. With pending changes, the caller must commit/revert first
@@ -556,7 +561,7 @@ class DBBrowserDB(QObject):
                             self.revert_to_savepoint(savepoint_name)
                         return False
                 head = st.text.lstrip()[:8].upper()
-                if head.startswith(("COMMIT", "END ", "END;", "BEGIN ", "BEGIN;")) or head == "END" or head == "BEGIN":
+                if is_transaction_control(st.text):
                     if not savepoint_name:
                         savepoint_name = self.generate_savepoint_name("execmultisql")
                         self.set_savepoint(savepoint_name)

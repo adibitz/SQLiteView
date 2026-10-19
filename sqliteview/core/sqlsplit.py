@@ -69,3 +69,11 @@ def statement_at(sql: str, cursor: int) -> Statement | None:
             return last or st
         last = st
     return last
+
+
+_TRANSACTION_CONTROL_RE = re.compile(r"\s*(BEGIN|COMMIT|END)\b", re.I)
+
+
+def is_transaction_control(sql: str) -> bool:
+    """BEGIN … / COMMIT / END statements, which scripts skip because they run inside a savepoint."""
+    return _TRANSACTION_CONTROL_RE.match(sql) is not None

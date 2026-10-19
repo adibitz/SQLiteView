@@ -6,13 +6,14 @@ import csv
 import json
 import os
 import re
+import tempfile
 from typing import Any, Literal, Optional, Sequence
 
 from ..core import sqlb
 from ..core.csvimport import (CsvImportError, CsvOptions, detect_fields, empty_values_for, import_csv_file,
                               read_preview)
 from ..core.rowexport import ROW_FORMATS, format_for_path, write_query_result
-from ..core.sqlsplit import split_statements
+from ..core.sqlsplit import is_transaction_control, split_statements
 from .editing import staged_result, execute_sql, insert_into
 from .models import RowFilter
 from .reading import filtered_query, reading_statement
@@ -22,8 +23,9 @@ IfExists = Literal["fail", "append", "replace"]
 PREVIEW_ROWS = 5
 MAX_JSON_IMPORT_BYTES = 200 * 1024 * 1024
 MAX_SQL_IMPORT_BYTES = 200 * 1024 * 1024
-# The BEGIN TRANSACTION; … COMMIT; wrapper of SQL dumps (an import is one change anyway)
-_TRANSACTION_LINE_RE = re.compile(r"^\s*(BEGIN|COMMIT|END)(\s+TRANSACTION)?\s*;?\s*$", re.I)
+# Dumps (sqlite3 .dump, iterdump) switch foreign keys off around their transaction; inside the import's
+# savepoint that pragma would be a no-op anyway, and the AI connection may not change pragmas.
+_DUMP_FK_PRAGMA_RE = re.compile(r"\s*PRAGMA\s+foreign_keys\s*=", re.I)
 
 
 def _import_target(session: DatabaseSession, table: str, if_exists: IfExists) -> tuple[str, Optional[sqlb.Table]]:
@@ -145,7 +147,8 @@ def import_json(session: DatabaseSession, path: str, table: Optional[str] = None
 # --------------------------------------------------------------------------- SQL
 
 def import_sql(session: DatabaseSession, path: str, dry_run: bool = False) -> dict[str, Any]:
-    """Run the statements of an .sql file as one change (the BEGIN/COMMIT lines of dumps are skipped)."""
+    """Run the statements of an .sql file as one change (the BEGIN/COMMIT and foreign-key pragma lines of
+    dumps are skipped)."""
     full = session.sandbox.resolve(path, must_exist=True)
     if os.path.getsize(full) > MAX_SQL_IMPORT_BYTES:
         raise ToolInputError(f"{full} is larger than {MAX_SQL_IMPORT_BYTES // 2**20} MB.")
@@ -154,7 +157,7 @@ def import_sql(session: DatabaseSession, path: str, dry_run: bool = False) -> di
             text = fh.read()
     except OSError as e:
         raise ToolInputError(f"Couldn't read {full}: {e}") from e
-    body = [st for st in split_statements(text) if not _TRANSACTION_LINE_RE.match(st)]
+    body = [st for st in split_statements(text) if not is_transaction_control(st) and not _DUMP_FK_PRAGMA_RE.match(st)]
     result = execute_sql(session, "\n".join(body), dry_run, description=f"import {os.path.basename(full)}")
     result["file"] = full
     return result
@@ -172,13 +175,15 @@ def export_data(session: DatabaseSession, path: str, table: Optional[str] = None
     fmt = format or format_for_path(path)
     if fmt not in ROW_FORMATS:
         raise ToolInputError(f"format must be one of {', '.join(ROW_FORMATS)}")
-    full = session.sandbox.writable_target(path, overwrite)
+    full = session.export_target(path, overwrite)
     if table is not None:
         q, t = filtered_query(session, table, filters)
         query, name = q.build_query(False).strip(), t.name
     else:
         query, name = reading_statement(sql), "result"
-    with session.reading():  # the export runs on this connection, with the read-only authorizer in place
+    # The export runs on this connection with the read-only authorizer in place; no time limit, since
+    # writing a whole large table can legitimately take longer than an interactive query.
+    with session.reading(timeout=False):
         rows = write_query_result(session.db, query, full, fmt, header=header, table=name)
     return {"file": full, "format": fmt, "rows": rows, "bytes": os.path.getsize(full)}
 
@@ -194,8 +199,16 @@ def export_sql_dump(session: DatabaseSession, path: str, tables: Optional[Sequen
     else:
         names = [n for n, t in db.schemata["main"].tables.items()
                  if not t.is_view() and not n.lower().startswith("sqlite_")]
-    full = session.sandbox.writable_target(path, overwrite)
-    if not db.dump(full, names, insert_col_names=True, insert_new_syntax=False, keep_original=False,
-                   export_schema=schema, export_data=data, keep_old_schema=False):
-        raise ToolInputError(f"Export failed: {db.last_error}")
+    full = session.export_target(path, overwrite)
+    # Dump next to the target and move it into place, so a failure never leaves a half-written file
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(full) + ".", suffix=".part", dir=os.path.dirname(full))
+    os.close(fd)
+    try:
+        if not db.dump(tmp, names, insert_col_names=True, insert_new_syntax=False, keep_original=False,
+                       export_schema=schema, export_data=data, keep_old_schema=False):
+            raise ToolInputError(f"Export failed: {db.last_error}")
+        os.replace(tmp, full)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return {"file": full, "tables": names, "bytes": os.path.getsize(full)}

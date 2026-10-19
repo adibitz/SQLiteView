@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
@@ -142,6 +143,23 @@ def clamp_limit(limit: int) -> int:
 
 # --------------------------------------------------------------------------- sandbox
 
+_WINDOWS_DEVICES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"}
+                             | {f"{d}{i}" for d in ("COM", "LPT") for i in range(1, 10)})
+SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _is_device_name(path: str) -> bool:
+    return sys.platform == "win32" and os.path.basename(path).split(".")[0].rstrip(" ").upper() in _WINDOWS_DEVICES
+
+
+def is_sqlite_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(SQLITE_HEADER)) == SQLITE_HEADER
+    except OSError:
+        return False
+
+
 def _inside(path: str, root: str) -> bool:
     p, r = os.path.normcase(path), os.path.normcase(root)
     try:
@@ -163,6 +181,8 @@ class Sandbox:
         :class:`ToolInputError` when it's outside every root."""
         if not path or not path.strip():
             raise ToolInputError("The path is empty.")
+        if _is_device_name(path.strip()):
+            raise ToolInputError(f"{path} is a Windows device name, not a file.")
         expanded = os.path.expanduser(path.strip())
         if not os.path.isabs(expanded):
             expanded = os.path.join(self.roots[0], expanded)
@@ -210,14 +230,16 @@ class DatabaseSession:
         if create and not os.path.exists(full):
             if not full.lower().endswith(DATABASE_EXTENSIONS):
                 raise ToolInputError(f"Use one of these extensions for a new database: {', '.join(DATABASE_EXTENSIONS)}")
-            ok = self.db.create(full)
+            ok = self.db.create(full, load_extensions=False, run_default_sql=False)
         else:
-            ok = self.db.open(full, self.read_only)
+            # The app's extension list and startup SQL aren't applied: extensions (fileio, sqlean …) would give
+            # the assistant file access outside the sandbox.
+            ok = self.db.open(full, self.read_only, load_extensions=False, run_default_sql=False)
         if not ok:
             raise ToolInputError(f"Couldn't open {full}: {self.db.last_error}")
         with self.db.exclusive("MCP setup") as conn:
             try:
-                conn.enable_load_extension(False)  # extensions from the settings stay loaded
+                conn.enable_load_extension(False)
             except (AttributeError, sqlite3.Error):
                 pass
         self.staged.clear()
@@ -241,6 +263,9 @@ class DatabaseSession:
         if not self.db.is_open():
             raise ToolInputError("No database is open. Call open_database first (list_database_files shows the "
                                  "files you can open).")
+        lost = self._forget_lost_transaction()
+        if lost:
+            log.warning("SQLite rolled back the transaction; lost: %s", "; ".join(lost))
         version = self._read_schema_version()
         if version != self._schema_version:
             self.db.update_schema()
@@ -257,6 +282,21 @@ class DatabaseSession:
         """Call after DDL so the next schema check doesn't re-read twice."""
         self.db.update_schema()
         self._schema_version = self._read_schema_version()
+
+    def export_target(self, path: str, overwrite: bool) -> str:
+        """Where an export may write: inside the sandbox, never over a database (the open one, its journal files,
+        or any other SQLite file), and in read-only mode never over an existing file."""
+        if overwrite and self.read_only:
+            raise ToolInputError("The server runs read-only: exports can create new files but not replace existing "
+                                 "ones. Choose a new file name.")
+        full = self.sandbox.writable_target(path, overwrite)
+        if self.db.is_open():
+            current = os.path.normcase(os.path.realpath(self.db.cur_file))
+            if os.path.normcase(full) in {current + suffix for suffix in ("", "-journal", "-wal", "-shm")}:
+                raise ToolInputError(f"{full} is the open database (or one of its journal files); export elsewhere.")
+        if os.path.exists(full) and is_sqlite_file(full):
+            raise ToolInputError(f"{full} is an SQLite database; exports never replace databases.")
+        return full
 
     # ------------------------------------------------------------------ objects
     def table(self, name: str, *, writable: bool = False) -> tuple[sqlb.ObjectIdentifier, sqlb.Table]:
@@ -281,11 +321,12 @@ class DatabaseSession:
 
     # ------------------------------------------------------------------ guarded access
     @contextmanager
-    def _guarded(self, authorizer: Callable[..., int]) -> Iterator[sqlite3.Connection]:
+    def _guarded(self, authorizer: Callable[..., int], timeout: bool = True) -> Iterator[sqlite3.Connection]:
         with self.db.exclusive("AI assistant") as conn:
-            deadline = time.monotonic() + self.query_timeout
             conn.set_authorizer(authorizer)
-            conn.set_progress_handler(lambda: int(time.monotonic() > deadline), PROGRESS_HANDLER_STEPS)
+            if timeout:
+                deadline = time.monotonic() + self.query_timeout
+                conn.set_progress_handler(lambda: int(time.monotonic() > deadline), PROGRESS_HANDLER_STEPS)
             conn.text_factory = _text_factory_fallback
             try:
                 yield conn
@@ -295,10 +336,11 @@ class DatabaseSession:
                 conn.text_factory = str
 
     @contextmanager
-    def reading(self) -> Iterator[sqlite3.Connection]:
-        """The connection, allowed to run reading statements only."""
+    def reading(self, timeout: bool = True) -> Iterator[sqlite3.Connection]:
+        """The connection, allowed to run reading statements only (``timeout=False`` for whole-table exports,
+        which may legitimately take long)."""
         self.require_open()
-        with self._guarded(read_authorizer) as conn:
+        with self._guarded(read_authorizer, timeout) as conn:
             yield conn
 
     @contextmanager
@@ -318,7 +360,13 @@ class DatabaseSession:
             raise ToolInputError(f"Couldn't start the change: {db.last_error}")
         try:
             yield db
-        except BaseException:
+        except BaseException as e:
+            lost = self._forget_lost_transaction()
+            if lost is not None:
+                earlier = "; ".join(lost) if lost else "none"
+                raise ToolInputError(f"{e}\nSQLite rolled back the whole transaction, not just this change, so all "
+                                     f"uncommitted changes were lost (earlier changes: {earlier}). The database is as "
+                                     "it was at the last commit_changes.") from e
             db.revert_to_savepoint(savepoint)
             self.schema_changed()  # the rolled-back statements may have been DDL
             raise
@@ -335,6 +383,23 @@ class DatabaseSession:
             yield conn
 
     # ------------------------------------------------------------------ transaction
+    def _in_transaction(self) -> bool:
+        with self.db.exclusive("MCP") as conn:
+            return conn is not None and conn.in_transaction
+
+    def _forget_lost_transaction(self) -> Optional[list[str]]:
+        """SQLite ends the whole transaction (not just a savepoint) when a write is interrupted, on ON CONFLICT
+        ROLLBACK and on RAISE(ROLLBACK). Then the savepoints the engine tracks no longer exist: forget them and
+        return the staged changes that were lost. None when the transaction is intact."""
+        if not self.db.savepoints or self._in_transaction():
+            return None
+        lost = list(self.staged)
+        self.db.savepoints.clear()
+        self.db.dbChanged.emit(False)
+        self.staged.clear()
+        self.schema_changed()
+        return lost
+
     def commit(self) -> list[str]:
         db = self.require_writable()
         done = list(self.staged)
@@ -347,6 +412,8 @@ class DatabaseSession:
         db = self.require_open()
         undone = list(self.staged)
         db.revert_all()
+        if self._in_transaction():  # e.g. a transaction a failed ROLLBACK TO left behind
+            db.execute_sql("ROLLBACK;", False, True)
         self.staged.clear()
         self.schema_changed()
         return undone

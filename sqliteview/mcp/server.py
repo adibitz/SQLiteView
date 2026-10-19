@@ -332,7 +332,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                               query_timeout=args.query_timeout)
     if args.db:
         try:
-            session.open(args.db, create=args.create)
+            session.open(os.path.abspath(args.db), create=args.create)  # relative to the current folder
         except ToolInputError as e:
             log.error("%s", e)
             return 2

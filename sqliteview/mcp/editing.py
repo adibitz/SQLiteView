@@ -37,18 +37,21 @@ def staged_result(session: DatabaseSession, result: dict[str, Any]) -> dict[str,
 
 def insert_into(conn: sqlite3.Connection, ident: sqlb.ObjectIdentifier, t: sqlb.Table, rows: Sequence[dict[str, Any]],
                 on_conflict: str = "abort") -> int:
-    """Insert ``rows`` (column -> value) keeping their order; returns how many were inserted."""
+    """Insert ``rows`` (column -> value) keeping their order; returns how many were inserted (rows written by
+    triggers don't count)."""
     clause = _conflict(on_conflict)
-    before = conn.total_changes
     run_cols: Optional[tuple[str, ...]] = None
     batch: list[list[Any]] = []
+    inserted = 0
 
     def flush() -> None:
+        nonlocal inserted
         if run_cols is None or not batch:
             return
         cols = ",".join(sqlb.escape_identifiers(run_cols))
-        conn.executemany(f"INSERT {clause} INTO {ident.to_string()} ({cols}) VALUES ({','.join('?' * len(run_cols))})",
-                         batch)
+        cur = conn.executemany(f"INSERT {clause} INTO {ident.to_string()} ({cols}) "
+                               f"VALUES ({','.join('?' * len(run_cols))})", batch)
+        inserted += cur.rowcount
         batch.clear()
 
     for i, row in enumerate(rows, 1):
@@ -60,7 +63,7 @@ def insert_into(conn: sqlite3.Connection, ident: sqlb.ObjectIdentifier, t: sqlb.
             run_cols = cols
         batch.append([param_value(v) for v in row.values()])
     flush()
-    return conn.total_changes - before
+    return inserted
 
 
 def insert_rows(session: DatabaseSession, table: str, rows: Sequence[dict[str, Any]],
@@ -122,9 +125,7 @@ def update_rows(session: DatabaseSession, table: str, values: dict[str, Any],
     if dry_run:
         return {"dry_run": True, "table": t.name, "would_update": matched, "sample_before": sample, "sql": sql}
     with session.writing(f"update {matched} row(s) in {t.name}") as conn:
-        before = conn.total_changes
-        conn.execute(sql, [param_value(v) for v in values.values()] + params)
-        updated = conn.total_changes - before
+        updated = conn.execute(sql, [param_value(v) for v in values.values()] + params).rowcount
     return staged_result(session, {"table": t.name, "updated": updated})
 
 
@@ -136,9 +137,7 @@ def delete_rows(session: DatabaseSession, table: str, filters: Optional[Sequence
     if dry_run:
         return {"dry_run": True, "table": t.name, "would_delete": matched, "sample": sample, "sql": sql}
     with session.writing(f"delete {matched} row(s) from {t.name}") as conn:
-        before = conn.total_changes
-        conn.execute(sql, params)
-        deleted = conn.total_changes - before
+        deleted = conn.execute(sql, params).rowcount  # rows removed by ON DELETE CASCADE don't count
     return staged_result(session, {"table": t.name, "deleted": deleted})
 
 

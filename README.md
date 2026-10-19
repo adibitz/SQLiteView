@@ -54,7 +54,7 @@ In the packaged builds the command is the `sqliteview-mcp` program next to SQlit
 
 ```
 sqliteview-mcp --db shop.db                  # read and edit shop.db
-sqliteview-mcp --db shop.db --read-only      # the assistant can only read (no edit/import tools at all)
+sqliteview-mcp --db shop.db --read-only      # the assistant can only read (no edit/import tools; exports only create new files)
 sqliteview-mcp --root D:/data                # no database yet; the assistant opens or creates one in D:/data
 sqliteview-mcp --db shop.db --root D:/csv    # also allow importing/exporting files in D:/csv
 ```
@@ -77,12 +77,20 @@ There are also resources (`sqlite://schema`, `sqlite://tables/{name}`) and two p
 * Changes are staged, like in the app: nothing reaches the file until `commit_changes` (Write Changes), and
   `revert_changes` undoes everything since the last commit. Uncommitted changes are discarded when the client
   disconnects. `dry_run` previews updates, deletes and imports.
+* A few failures make SQLite drop the whole transaction, not just one change: a write stopped by the time
+  limit, `ON CONFLICT ROLLBACK`, and `RAISE(ROLLBACK)` in a trigger. The tool error then says that every
+  uncommitted change was lost.
 * Updating or deleting without a filter needs an explicit `all_rows=true`.
 * SQL from the assistant runs under an SQLite authorizer. Read tools can only read. Write tools can't ATTACH
   files, change PRAGMA settings, end the transaction or load extensions. Statements stop after 30 seconds
   (`--query-timeout`). Values are always bound as parameters, and table and column names are quoted.
-* Files can only be read and written inside the `--root` folders (by default, the folder of `--db`), and
-  existing files are only overwritten with `overwrite=true`.
+* The server never loads the extensions listed in Preferences › Extensions, and doesn't run the "SQL to
+  execute after opening" either. Extensions such as fileio would give the assistant file access.
+* Files can only be read and written inside the `--root` folders (by default, the folder of `--db`). Existing
+  files are only overwritten with `overwrite=true` (never in read-only mode), and exports never replace a
+  database file.
+* Regular expressions (the `regex` filter, `REGEXP`) run in Python and can't be stopped by the time limit, so
+  a pathological pattern can stall the server until it finishes.
 * Tools carry MCP hints (`readOnlyHint`, `destructiveHint`) so clients can ask you before destructive steps.
 * If SQliteView has the same database open with unwritten changes, the assistant gets a "database is locked"
   message until you write or revert them.

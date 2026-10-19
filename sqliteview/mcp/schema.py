@@ -6,7 +6,7 @@ import os
 from typing import Any
 
 from ..core import sqlb
-from .session import DATABASE_EXTENSIONS, DatabaseSession, cell_value
+from .session import DATABASE_EXTENSIONS, DatabaseSession, ToolInputError, cell_value
 
 MAX_LISTED_FILES = 200
 
@@ -40,7 +40,10 @@ def list_database_files(session: DatabaseSession) -> dict[str, Any]:
         for pattern in ("*", os.path.join("*", "*")):
             for p in glob.glob(os.path.join(glob.escape(root), pattern)):
                 if p.lower().endswith(DATABASE_EXTENSIONS) and os.path.isfile(p):
-                    files.append(p)
+                    try:
+                        files.append(session.sandbox.resolve(p))  # skips links that lead outside
+                    except ToolInputError:
+                        pass
     files = sorted(set(files))
     return {"folders": session.sandbox.roots, "files": files[:MAX_LISTED_FILES],
             "truncated": len(files) > MAX_LISTED_FILES, "open": session.path or None}

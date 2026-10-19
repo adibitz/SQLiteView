@@ -465,3 +465,148 @@ def test_client_config_snippets(tmp_path):
     claude_code = by_name["Claude Code"].snippet(["C:/Program Files/SQliteView/sqliteview-mcp.exe"], args)
     assert claude_code.startswith("claude mcp add sqliteview -- ") and "my shop.db" in claude_code
     assert "claude_desktop_config.json" in by_name["Claude Desktop"].where
+
+
+# ---------------------------------------------------------------------------- review regressions
+
+async def test_write_that_loses_the_transaction_is_reported(workdir):
+    """An interrupted write makes SQLite roll back the whole transaction, not just its savepoint."""
+    s = DatabaseSession(Sandbox([str(workdir)]), query_timeout=0.2)
+    s.open(str(workdir / "demo.db"))
+    slow = ("UPDATE customers SET meta = (WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r "
+            "LIMIT 2000000) SELECT COUNT(*) FROM r)")
+    async with connect(s) as c:
+        await call(c, "insert_rows", table="customers", rows=[{"name": "Kept?"}])
+        msg = await fails(c, "execute_sql", sql=slow)
+        assert "lost" in msg and "insert 1 row(s) into customers" in msg
+        assert (await call(c, "pending_changes")) == {"database": s.path, "uncommitted": False, "changes": []}
+        await call(c, "insert_rows", table="customers", rows=[{"name": "After"}])
+        assert (await call(c, "commit_changes"))["committed"]
+    s.close()
+    assert file_rows(str(workdir / "demo.db"), "SELECT name FROM customers WHERE id > 500") == [("After",)]
+
+
+async def test_counts_ignore_trigger_and_cascade_rows(session):
+    async with connect(session) as c:
+        r = await call(c, "insert_rows", table="orders", rows=[{"customer_id": 1, "sku": "SKU-0001"},
+                                                               {"customer_id": 2, "sku": "SKU-0002"}])
+        assert (r["inserted"], r["skipped"]) == (2, 0)  # trg_stock also updates products
+        orders_of_1 = file_rows(session.path, "SELECT COUNT(*) FROM orders WHERE customer_id = 1")[0][0]
+        assert orders_of_1 > 0
+        assert (await call(c, "delete_rows", table="customers", rowids=[1]))["deleted"] == 1  # cascades to orders
+        r = await call(c, "update_rows", table="orders", values={"quantity": 2},
+                       filters=[{"column": "customer_id", "op": "equals", "value": 3}])
+        assert r["updated"] == file_rows(session.path, "SELECT COUNT(*) FROM orders WHERE customer_id = 3")[0][0]
+
+
+async def test_import_sqlite_cli_dump(session, workdir):
+    (workdir / "cli.sql").write_text("PRAGMA foreign_keys=OFF;\nBEGIN IMMEDIATE TRANSACTION;\nCREATE TABLE z(a);\n"
+                                     "INSERT INTO z VALUES(1);\ncommit;\n", encoding="utf-8")
+    async with connect(session) as c:
+        assert (await call(c, "import_sql", path="cli.sql"))["statements"] == 2
+        assert (await call(c, "run_query", sql="SELECT a FROM z"))["rows"] == [[1]]
+
+
+async def test_export_ignores_query_timeout(workdir):
+    s = DatabaseSession(Sandbox([str(workdir)]), query_timeout=0.001)
+    s.open(str(workdir / "demo.db"))
+    async with connect(s) as c:
+        assert (await call(c, "export_data", path="orders.json", table="orders"))["rows"] == 20000
+    s.close()
+
+
+async def test_failed_dump_keeps_existing_file(session, workdir, monkeypatch):
+    from sqliteview.core.db import DBBrowserDB
+    target = workdir / "keep.sql"
+    target.write_text("original", encoding="utf-8")
+
+    def broken_dump(self, filename, *args, **kwargs):
+        with open(filename, "w", encoding="utf-8") as fh:
+            fh.write("BEGIN TRANSACTION;\npartial")
+        self.last_error = "disk full"
+        return False
+    monkeypatch.setattr(DBBrowserDB, "dump", broken_dump)
+    async with connect(session) as c:
+        assert "disk full" in await fails(c, "export_sql_dump", path="keep.sql", overwrite=True)
+    assert target.read_text(encoding="utf-8") == "original"
+    assert not [n for n in os.listdir(workdir) if n.endswith(".part")]
+
+
+def test_relative_db_is_relative_to_current_folder(workdir):
+    (workdir / "other").mkdir()
+    env = dict(os.environ, PYTHONPATH=os.path.abspath(APP_DIR))
+    proc = subprocess.run([sys.executable, "-m", "sqliteview.mcp", "--root", "other", "--db", "demo.db"],
+                          capture_output=True, timeout=60, env=env, input=b"", cwd=str(workdir))
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+
+
+# ---------------------------------------------------------------------------- security review regressions
+
+async def test_exports_never_replace_databases(session, workdir):
+    shutil.copy(workdir / "demo.db", workdir / "other.db")
+    async with connect(session) as c:
+        assert "open database" in await fails(c, "export_sql_dump", path="demo.db", overwrite=True)
+        assert "open database" in await fails(c, "export_data", path="demo.db-journal", table="customers",
+                                              overwrite=True)
+        assert "never replace databases" in await fails(c, "export_data", path="other.db", sql="SELECT 1",
+                                                        overwrite=True)
+    for name in ("demo.db", "other.db"):
+        assert file_rows(str(workdir / name), "SELECT COUNT(*) FROM customers") == [(500,)]
+
+
+async def test_read_only_exports_only_create_files(workdir):
+    (workdir / "notes.csv").write_text("keep", encoding="utf-8")
+    s = DatabaseSession(Sandbox([str(workdir)]), read_only=True)
+    s.open(str(workdir / "demo.db"))
+    async with connect(s) as c:
+        assert "read-only" in await fails(c, "export_data", path="notes.csv", table="customers", overwrite=True)
+        assert (await call(c, "export_data", path="new.csv", table="customers"))["rows"] == 500
+    s.close()
+    assert (workdir / "notes.csv").read_text(encoding="utf-8") == "keep"
+
+
+async def test_whole_transaction_rollback_never_commits_reverted_changes(session):
+    async with connect(session) as c:
+        await call(c, "execute_sql", sql="CREATE TABLE u(k UNIQUE ON CONFLICT ROLLBACK); CREATE TABLE log(x)")
+        await call(c, "commit_changes")
+        await call(c, "insert_rows", table="log", rows=[{"x": "A"}])
+        msg = await fails(c, "execute_sql", sql="INSERT INTO u VALUES (1), (1)")
+        assert "lost" in msg and "insert 1 row(s) into log" in msg
+        assert not (await call(c, "pending_changes"))["uncommitted"]
+        await call(c, "insert_rows", table="log", rows=[{"x": "C"}])
+        assert (await call(c, "revert_changes"))["reverted"] == ["insert 1 row(s) into log"]
+        await call(c, "insert_rows", table="log", rows=[{"x": "D"}])
+        await call(c, "commit_changes")
+    assert file_rows(session.path, "SELECT x FROM log") == [("D",)]
+
+
+def test_open_ignores_extensions_and_startup_sql_from_settings(workdir, monkeypatch):
+    from sqliteview.core.db import DBBrowserDB
+    from sqliteview.core.settings import Settings
+    loaded = []
+    monkeypatch.setattr(DBBrowserDB, "load_extensions_from_settings", lambda self: loaded.append(self))
+    Settings.set("db", "defaultsqltext", "CREATE TABLE injected(a);")
+    try:
+        s = DatabaseSession(Sandbox([str(workdir)]))
+        s.open(str(workdir / "demo.db"))
+        assert loaded == [] and s.db.get_table_by_name(sqlb_ident("injected")) is None
+        s.close()
+        app_db = DBBrowserDB()  # the window app still applies both
+        assert app_db.open(str(workdir / "demo.db")) and loaded == [app_db]
+        assert app_db.get_table_by_name(sqlb_ident("injected")) is not None
+        app_db.close(force=True)
+    finally:
+        Settings.set("db", "defaultsqltext", "")
+
+
+def sqlb_ident(name):
+    from sqliteview.core import sqlb
+    return sqlb.ObjectIdentifier("main", name)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows device names")
+def test_windows_device_names_are_refused(tmp_path):
+    for name in ("NUL", "con.csv", "CONIN$", "com1.txt", "sub/aux"):
+        with pytest.raises(ToolInputError, match="device name"):
+            Sandbox([str(tmp_path)]).resolve(name)
+    assert Sandbox([str(tmp_path)]).resolve("console.csv").endswith("console.csv")
