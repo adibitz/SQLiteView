@@ -32,6 +32,61 @@ sqliteview db.sqlite -s q.sql   # open (and run) a SQL file;  add -q to quit aft
 sqliteview work.sqbpro          # open a project (database, tabs, filters, layout)
 ```
 
+## Use with Claude and other AI assistants (MCP)
+
+SQliteView includes an [MCP](https://modelcontextprotocol.io) server, `sqliteview-mcp`. With it, Claude Desktop,
+Claude Code, Cursor, VS Code and other MCP clients can read your schema, run and explain queries, filter rows,
+edit data, and import or export files. You never start it yourself: the AI client launches it in the background
+and talks to it over stdin/stdout.
+
+**Set it up once:** open **Help › Connect AI Assistant…** in SQliteView, pick your client, and copy the snippet.
+It already contains the right path for your installation and, if you like, the database you have open. Or write
+it by hand:
+
+| Client | Configuration |
+|---|---|
+| Claude Code | `claude mcp add sqliteview -- sqliteview-mcp --db D:/data/shop.db` |
+| Claude Desktop / Cursor | `{"mcpServers": {"sqliteview": {"command": "sqliteview-mcp", "args": ["--db", "D:/data/shop.db"]}}}` in `claude_desktop_config.json` / `~/.cursor/mcp.json` |
+| VS Code | `{"servers": {"sqliteview": {"type": "stdio", "command": "sqliteview-mcp", "args": ["--db", "D:/data/shop.db"]}}}` in `.vscode/mcp.json` |
+
+In the packaged builds the command is the `sqliteview-mcp` program next to SQliteView: `C:\Program Files\SQliteView\sqliteview-mcp.exe`,
+`/Applications/SQliteView.app/Contents/MacOS/sqliteview-mcp`, or `SQliteView-….AppImage mcp` on Linux.
+
+```
+sqliteview-mcp --db shop.db                  # read and edit shop.db
+sqliteview-mcp --db shop.db --read-only      # the assistant can only read (no edit/import tools at all)
+sqliteview-mcp --root D:/data                # no database yet; the assistant opens or creates one in D:/data
+sqliteview-mcp --db shop.db --root D:/csv    # also allow importing/exporting files in D:/csv
+```
+
+**Tools**
+
+| Area | Tools |
+|---|---|
+| Schema | `get_schema` (all CREATE statements), `list_tables`, `describe_table` (columns, keys, foreign keys, indices, triggers, sample rows), `database_info`, `list_database_files`, `open_database` |
+| Query | `run_query` (one read-only statement, with parameters and paging), `explain_query` (checks SQL without running it, shows the query plan) |
+| Filter | `filter_rows`: conditions (`equals`, `gt`, `between`, `starts`, `regex`, `null` …), search in all columns, sorting, column choice and paging, without writing SQL; returns the matching count and the equivalent SQL |
+| Edit | `insert_rows`, `update_rows`, `delete_rows` (by filters or `_rowid_`), `create_table`, `execute_sql` (scripts), `pending_changes`, `commit_changes`, `revert_changes` |
+| Import / export | `import_csv`, `import_json`, `import_sql`; `export_data` (table, filtered table or query to CSV, TSV, JSON, SQL or Markdown), `export_sql_dump` |
+
+There are also resources (`sqlite://schema`, `sqlite://tables/{name}`) and two prompts (`explore_database`,
+`answer_question`).
+
+**Safety**
+
+* Changes are staged, like in the app: nothing reaches the file until `commit_changes` (Write Changes), and
+  `revert_changes` undoes everything since the last commit. Uncommitted changes are discarded when the client
+  disconnects. `dry_run` previews updates, deletes and imports.
+* Updating or deleting without a filter needs an explicit `all_rows=true`.
+* SQL from the assistant runs under an SQLite authorizer. Read tools can only read. Write tools can't ATTACH
+  files, change PRAGMA settings, end the transaction or load extensions. Statements stop after 30 seconds
+  (`--query-timeout`). Values are always bound as parameters, and table and column names are quoted.
+* Files can only be read and written inside the `--root` folders (by default, the folder of `--db`), and
+  existing files are only overwritten with `overwrite=true`.
+* Tools carry MCP hints (`readOnlyHint`, `destructiveHint`) so clients can ask you before destructive steps.
+* If SQliteView has the same database open with unwritten changes, the assistant gets a "database is locked"
+  message until you write or revert them.
+
 ## What's new in the UI
 
 | Upstream | This edition |
@@ -60,6 +115,7 @@ sqliteview work.sqbpro          # open a project (database, tabs, filters, layou
 ```
 app/
   main.py                    entry point
+  mcp_main.py                entry point of the bundled sqliteview-mcp program
   sqliteview/
     app.py                   QApplication bootstrap, CLI (port of main.cpp / Application.cpp)
     core/                    engine — no widgets
@@ -78,12 +134,20 @@ app/
       condformat.py          conditional formats      <- src/CondFormat.cpp, SqliteTableModel::getMatchingCondFormat
       display_format.py      display format presets   <- src/ColumnDisplayFormatDialog.cpp
       plotdata.py            rows -> plot series      <- src/PlotDock.cpp (guessDataType, data conversion)
+      csvimport.py           CSV parsing, type detection, import <- src/csvparser.cpp, ImportCsvDialog
+      rowexport.py           rows -> CSV/TSV/JSON/SQL/Markdown, streaming export <- ExportDataDialog
+    mcp/                     MCP server for AI assistants (no widgets)
+      server.py              tools, resources, prompts, `sqliteview-mcp` command line
+      session.py             open database, folder sandbox, SQL authorizers, staging/commit
+      schema.py, reading.py, editing.py, transfer.py   the tools, grouped by area
+      models.py              structured tool inputs (filters, sort keys, column specs)
+      clientconfig.py        launch command + client config snippets (no MCP SDK import; used by the UI)
     ui/                      PySide6 widgets (new design)
       main_window.py, explorer.py, table_tab.py, sql_tab.py, data_grid.py, inspector.py,
       sql_editor.py, db_info_tab.py, log_panel.py, plot_dock.py, welcome.py, command_palette.py,
       theme.py (tokens + QSS), icons.py (inline SVG), widgets.py (design-system components)
       dialogs/               edit_table, edit_index, import_csv, export_data, export_sql,
-                             add_record, preferences, display_format, cond_format, misc
+                             add_record, preferences, display_format, cond_format, connect_ai, misc
     assets/                  bundled DM Sans font (+ OFL licence) and app icons
   tests/                     engine + UI tests (run offscreen)
   scripts/
@@ -91,11 +155,11 @@ app/
     make_icons.py            regenerate assets/icons from the vector glyph (needs Pillow)
     make_demo_db.py          sample database used by the tests
   packaging/
-    sqliteview.spec          PyInstaller spec (one-folder build, macOS .app bundle)
+    sqliteview.spec          PyInstaller spec (one-folder build with SQliteView + sqliteview-mcp, macOS .app bundle)
     windows/sqliteview.iss   Inno Setup installer
     linux/sqliteview.desktop desktop entry (tarball / AppImage)
   .github/workflows/release.yml   CI: tests + Windows/macOS/Linux builds, releases on tags
-  pyproject.toml             package metadata, dependencies, `sqliteview` command
+  pyproject.toml             package metadata, dependencies, `sqliteview` and `sqliteview-mcp` commands
 ```
 
 ### Engine behaviour kept from the original
@@ -176,14 +240,15 @@ sudo dnf install mesa-libEGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-ut
    .venv\Scripts\activate           # Windows (PowerShell: .venv\Scripts\Activate.ps1)
    ```
 
-3. Install the app in editable mode with the developer tools (pytest, PyInstaller, Pillow)
+3. Install the app in editable mode with the developer tools (pytest, PyInstaller, Pillow) and the MCP server
 
    ```bash
    python -m pip install --upgrade pip
    python -m pip install -e ".[dev]"
    ```
 
-   Only want to run it? `python -m pip install -r requirements.txt` installs just PySide6.
+   Only want to run it? `python -m pip install -r requirements.txt` installs just PySide6;
+   `python -m pip install -e ".[mcp]"` adds the MCP server (`sqliteview-mcp`, or `python -m sqliteview.mcp`).
 
 4. Run it
 
@@ -207,6 +272,8 @@ sudo dnf install mesa-libEGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-ut
 ### Project layout and conventions
 
 * `sqliteview/core` is the engine and must not import widgets; `sqliteview/ui` is everything Qt Widgets.
+  `sqliteview/mcp` builds on `core` only. The UI may import `mcp/clientconfig.py`, which doesn't need the MCP SDK.
+* The MCP server owns stdout (it carries the protocol): log to stderr through `logging`, never `print`.
 * Colours, spacing and fonts come from the design tokens in `ui/theme.py`; icons from `ui/icons.py`; reusable
   controls from `ui/widgets.py`. Use those rather than hard-coding styles.
 * Settings and their defaults live in `core/settings.py` (stored with `QSettings` under the name `sqliteview`).
@@ -235,6 +302,11 @@ Everything lands in `dist/`:
 
 The unpacked app is in `dist/SQliteView/` (`dist/SQliteView.app` on macOS) if you want to try it before
 packaging. `python scripts/build.py --skip-bundle` re-packages an existing build without running PyInstaller again.
+
+The bundle holds two programs that share one `_internal` folder: `SQliteView` (windowed) and `sqliteview-mcp`
+(console). The MCP server needs real stdin/stdout, which windowed programs don't have on Windows. After
+bundling, `build.py` starts `sqliteview-mcp` like an AI client would (handshake, tool list, two tool calls) and
+stops the build if it doesn't answer. This catches modules PyInstaller missed and anything that writes to stdout.
 Build Linux packages on the oldest distribution you want to support (the app needs that glibc or newer).
 
 ### With GitHub Actions (all platforms)
