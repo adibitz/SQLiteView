@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
 
 from . import sqlb
@@ -90,8 +91,8 @@ def write_query_result(db: "DBBrowserDB", query: str, path: str, fmt: str = "csv
                        table: str = "table", progress: Optional[Callable[[int], bool]] = None) -> int:
     """Run ``query`` and write its rows to ``path`` in one of ``ROW_FORMATS``; returns the row count.
 
-    The file appears atomically (written to ``path + '.part'`` first). CSV/TSV stream row by row;
-    the other formats are rendered in one go. ``progress(rows_so_far)`` returning False cancels
+    The file appears atomically (written to a new temporary file next to it first). CSV/TSV stream
+    row by row, JSON rows are converted while reading; SQL and Markdown are rendered in one go. ``progress(rows_so_far)`` returning False cancels
     with :class:`ExportCancelled`; SQLite and file errors propagate. Nothing is left behind on failure.
     """
     from .db import _text_factory_fallback
@@ -100,16 +101,18 @@ def write_query_result(db: "DBBrowserDB", query: str, path: str, fmt: str = "csv
         raise ValueError(f"unknown export format {fmt!r}")
     if fmt == "tsv":
         sep, quote = "\t", '"'
-    tmp = path + ".part"
     n = 0
     with db.get("exporting data") as conn:
         if conn is None:
             raise OSError("No database file opened")
         conn.text_factory = _text_factory_fallback
+        tmp = ""
         try:
             cur = db.run(conn, query)
             names = [d[0] for d in cur.description or []]
-            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part",
+                                       dir=os.path.dirname(os.path.abspath(path)))
+            with open(fd, "w", encoding="utf-8", newline="") as fh:
                 if fmt in ("csv", "tsv"):
                     if header:
                         q = quote or ""
@@ -120,15 +123,18 @@ def write_query_result(db: "DBBrowserDB", query: str, path: str, fmt: str = "csv
                         if progress is not None and n % 5000 == 0 and not progress(n):
                             raise ExportCancelled()
                 else:
-                    rows = []
+                    rows: list = []
                     for r in cur:
-                        rows.append(r)
+                        rows.append({k: json_value(v) for k, v in zip(names, r)} if fmt == "json" else r)
                         n += 1
                         if progress is not None and n % 2000 == 0 and not progress(n):
                             raise ExportCancelled()
-                    fh.write(format_rows(fmt, names, rows, table=table, pretty_json=pretty_json))
+                    if fmt == "json":
+                        json.dump(rows, fh, ensure_ascii=False, indent=4 if pretty_json else None)
+                    else:
+                        fh.write(format_rows(fmt, names, rows, table=table))
         except BaseException:
-            if os.path.exists(tmp):
+            if tmp and os.path.exists(tmp):
                 os.remove(tmp)
             raise
         finally:
