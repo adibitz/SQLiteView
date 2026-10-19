@@ -52,7 +52,25 @@ it by hand:
 In the packaged builds the command is the `sqliteview-mcp` program next to SQliteView: `C:\Program Files\SQliteView\sqliteview-mcp.exe`,
 `/Applications/SQliteView.app/Contents/MacOS/sqliteview-mcp`, or `SQliteView-….AppImage mcp` on Linux.
 
+**Two ways to connect**
+
+* **This window (live mode).** Turn on **Tools › Allow AI Assistants** and configure the client with
+  `sqliteview-mcp --live`. The assistant then works on whatever database is open in the SQliteView window.
+  * Its changes show up in the grid right away, with a toast naming each change.
+  * They stay unsaved until *you* press **Write Changes**, or drop them with **Revert Changes**. In live mode
+    the assistant has no commit, revert or open tools.
+  * The app serves the tools on `127.0.0.1` only (port 47652 by default, setting `mcp/live_port`), and every
+    request must carry a token kept in the app's settings. `sqliteview-mcp --live` is a small stdio bridge that
+    reads the port and token from there, so no secret ends up in the client's configuration.
+  * While the assistant is working, the app waits for it. If you need the database at that moment, you're
+    offered to stop a *read*. A *change* is always allowed to finish, because stopping it would make SQLite
+    undo your own unsaved edits too. Each change holds the database from start to end, so Write and Revert
+    Changes never land in the middle of one. Turning live mode off ends a running read at once.
+* **A database file (standalone).** The client starts `sqliteview-mcp --db file.db`, and the app doesn't need
+  to be running. The assistant commits its own changes, after asking you.
+
 ```
+sqliteview-mcp --live                        # the database open in the SQliteView window (live mode)
 sqliteview-mcp --db shop.db                  # read and edit shop.db
 sqliteview-mcp --db shop.db --read-only      # the assistant can only read (no edit/import tools; exports only create new files)
 sqliteview-mcp --root D:/data                # no database yet; the assistant opens or creates one in D:/data
@@ -85,7 +103,9 @@ There are also resources (`sqlite://schema`, `sqlite://tables/{name}`) and two p
   files, change PRAGMA settings, end the transaction or load extensions. Statements stop after 30 seconds
   (`--query-timeout`). Values are always bound as parameters, and table and column names are quoted.
 * The server never loads the extensions listed in Preferences › Extensions, and doesn't run the "SQL to
-  execute after opening" either. Extensions such as fileio would give the assistant file access.
+  execute after opening" either. Extensions such as fileio would give the assistant file access. SQL from the
+  assistant may also only call SQLite's built-in functions and virtual tables. This matters in live mode,
+  where the window's connection does have your extensions loaded.
 * Files can only be read and written inside the `--root` folders (by default, the folder of `--db`). Existing
   files are only overwritten with `overwrite=true` (never in read-only mode), and exports never replace a
   database file.
@@ -147,6 +167,7 @@ app/
     mcp/                     MCP server for AI assistants (no widgets)
       server.py              tools, resources, prompts, `sqliteview-mcp` command line
       session.py             open database, folder sandbox, SQL authorizers, staging/commit
+      live.py                live mode: HTTP server inside the app (127.0.0.1 + token), `--live` stdio bridge
       schema.py, reading.py, editing.py, transfer.py   the tools, grouped by area
       models.py              structured tool inputs (filters, sort keys, column specs)
       clientconfig.py        launch command + client config snippets (no MCP SDK import; used by the UI)
@@ -285,6 +306,8 @@ sudo dnf install mesa-libEGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-ut
 * Colours, spacing and fonts come from the design tokens in `ui/theme.py`; icons from `ui/icons.py`; reusable
   controls from `ui/widgets.py`. Use those rather than hard-coding styles.
 * Settings and their defaults live in `core/settings.py` (stored with `QSettings` under the name `sqliteview`).
+  Setting the environment variable `SQLITEVIEW_SETTINGS` to an `.ini` path makes the app and `sqliteview-mcp`
+  use that file instead. This is useful for portable setups, and `build.py` uses it for its live-mode check.
 * The version is `__version__` in `sqliteview/__init__.py`; `pyproject.toml`, the PyInstaller spec, the build
   script and the installer all read it from there.
 
@@ -315,6 +338,7 @@ The bundle holds two programs that share one `_internal` folder: `SQliteView` (w
 (console). The MCP server needs real stdin/stdout, which windowed programs don't have on Windows. After
 bundling, `build.py` starts `sqliteview-mcp` like an AI client would (handshake, tool list, two tool calls) and
 stops the build if it doesn't answer. This catches modules PyInstaller missed and anything that writes to stdout.
+It then starts the bundled app headless with live mode on and queries it through `sqliteview-mcp --live`.
 Build Linux packages on the oldest distribution you want to support (the app needs that glibc or newer).
 
 ### With GitHub Actions (all platforms)
