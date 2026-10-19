@@ -333,7 +333,7 @@ class DBBrowserDB(QObject):
                 pass
             self._conn = None
         self.cur_file = ""
-        self.schemata.clear()
+        self.schemata = {}  # swapped, not cleared: another thread may be iterating the old map
         self.savepoints.clear()
         self.dbChanged.emit(False)
         self.structureUpdated.emit()
@@ -399,32 +399,39 @@ class DBBrowserDB(QObject):
             return False
         if self.read_only:
             return False
-        if unique and name in self.savepoints:
-            return True
-        self.execute_sql(f"SAVEPOINT {sqlb.escape_identifier(name)};", False, True)
-        self.savepoints.append(name)
+        # The savepoint list and the SQL change together under the lock: another thread (the MCP live
+        # server) may set and release savepoints at the same time as the UI.
+        with self.exclusive("setting a restore point"):
+            if unique and name in self.savepoints:
+                return True
+            self.execute_sql(f"SAVEPOINT {sqlb.escape_identifier(name)};", False, True)
+            self.savepoints.append(name)
         self.dbChanged.emit(self.dirty)
         return True
 
     def release_savepoint(self, name: str = "RESTOREPOINT") -> bool:
         if not self.is_open():
             return False
-        if name not in self.savepoints:
-            return True
-        if not self.execute_sql(f"RELEASE {sqlb.escape_identifier(name)};", False, True):
-            return False
-        idx = len(self.savepoints) - 1 - self.savepoints[::-1].index(name)
-        del self.savepoints[idx:]
+        with self.exclusive("committing changes"):
+            if name not in self.savepoints:
+                return True
+            if not self.execute_sql(f"RELEASE {sqlb.escape_identifier(name)};", False, True):
+                return False
+            idx = len(self.savepoints) - 1 - self.savepoints[::-1].index(name)
+            del self.savepoints[idx:]
         self.dbChanged.emit(self.dirty)
         return True
 
     def revert_to_savepoint(self, name: str = "RESTOREPOINT") -> bool:
-        if not self.is_open() or name not in self.savepoints:
+        if not self.is_open():
             return False
-        self.execute_sql(f"ROLLBACK TO SAVEPOINT {sqlb.escape_identifier(name)};", False, True)
-        self.execute_sql(f"RELEASE {sqlb.escape_identifier(name)};", False, True)
-        idx = len(self.savepoints) - 1 - self.savepoints[::-1].index(name)
-        del self.savepoints[idx:]
+        with self.exclusive("reverting changes"):
+            if name not in self.savepoints:
+                return False
+            self.execute_sql(f"ROLLBACK TO SAVEPOINT {sqlb.escape_identifier(name)};", False, True)
+            self.execute_sql(f"RELEASE {sqlb.escape_identifier(name)};", False, True)
+            idx = len(self.savepoints) - 1 - self.savepoints[::-1].index(name)
+            del self.savepoints[idx:]
         self.dbChanged.emit(self.dirty)
         return True
 
@@ -440,9 +447,10 @@ class DBBrowserDB(QObject):
         return True
 
     def revert_all(self) -> bool:
-        while self.savepoints:
-            if not self.revert_to_savepoint(self.savepoints[0]):
-                return False
+        with self.exclusive("reverting changes"):
+            while self.savepoints:
+                if not self.revert_to_savepoint(self.savepoints[0]):
+                    return False
         return True
 
     def set_undo_savepoint(self) -> bool:
@@ -474,7 +482,8 @@ class DBBrowserDB(QObject):
         if not m or self._conn is None:
             return False
         name = m.group(1)
-        if self.collation_handler is not None and not self.collation_handler(name):
+        # The handler asks the user, which only the main thread may do; other threads just fail
+        if self.collation_handler is not None and (not is_main_thread() or not self.collation_handler(name)):
             return False
         self._conn.create_collation(name, _collate_binary)
         return True
@@ -968,8 +977,11 @@ class DBBrowserDB(QObject):
             return []
 
     def update_schema(self) -> None:
-        self.schemata = {}
+        # Built aside and swapped in at the end, so readers on other threads (the MCP live server runs on
+        # one) see either the old or the new schema, never a half-read one.
+        schemata: dict[str, ObjectMap] = {}
         if self._conn is None:
+            self.schemata = schemata
             self.structureUpdated.emit()
             return
         with self.exclusive("reading schema") as conn:
@@ -980,7 +992,7 @@ class DBBrowserDB(QObject):
                 dbs = []
             self.log_sql("PRAGMA database_list;")
             for _, schema_name, _file in dbs:
-                objmap = self.schemata.setdefault(schema_name, ObjectMap())
+                objmap = schemata.setdefault(schema_name, ObjectMap())
                 if schema_name == "temp":
                     statement = "SELECT type,name,sql,tbl_name FROM sqlite_temp_master;"
                 else:
@@ -1033,6 +1045,7 @@ class DBBrowserDB(QObject):
                     mt.original_sql = (f"CREATE TABLE {master} (\n  type text,\n  name text,\n  tbl_name text,\n"
                                        "  rootpage integer,\n  sql text\n)")
                     objmap.tables[master] = mt
+            self.schemata = schemata  # under the lock, so an older read can't replace a newer one
         self.structureUpdated.emit()
 
     def _find_ci(self, mapping: dict, key: str):
