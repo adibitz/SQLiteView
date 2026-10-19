@@ -197,7 +197,7 @@ def test_connect_ai_dialog(window, qapp):
     from sqliteview.mcp.clientconfig import CLIENTS
     from sqliteview.ui.dialogs.connect_ai import ConnectAiDialog
     assert window.act_connect_ai.isEnabled()
-    dlg = ConnectAiDialog(window.db.cur_file, False, window)
+    dlg = ConnectAiDialog(window.db.cur_file, False, window.act_live_ai, window)
     assert json.loads(dlg.snippet.toPlainText())["mcpServers"]["sqliteview"]["args"][-2:] == ["--db", window.db.cur_file]
     dlg.read_only.setChecked(True)
     dlg.clients.button(1).click()
@@ -207,6 +207,70 @@ def test_connect_ai_dialog(window, qapp):
     assert "--db" not in dlg.snippet.toPlainText()
     dlg.copy()
     assert QGuiApplication.clipboard().text() == dlg.snippet.toPlainText()
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_live_ai_mode(window, qapp):
+    import httpx
+    from sqliteview.core.settings import Settings
+    from sqliteview.mcp.live import live_token, live_url
+    from sqliteview.ui.dialogs.connect_ai import MODE_LIVE, ConnectAiDialog
+    from sqliteview.ui.table_tab import TableTab
+    Settings.set("mcp", "live_port", _free_port())
+    tab = window.open_table(sqlb.ObjectIdentifier("main", "customers"))
+    assert pump(qapp, loaded(tab.model))
+    dlg = ConnectAiDialog(window.db.cur_file, False, window.act_live_ai, window)
+    dlg.show()
+    assert dlg.mode.current() != MODE_LIVE  # live mode is off
+    dlg.mode.button(MODE_LIVE).click()
+    assert "--live" in dlg.snippet.toPlainText() and dlg.live_button.isVisible()
+    try:
+        dlg.live_button.click()  # turns on Tools > Allow AI Assistants
+        assert window.act_live_ai.isChecked() and window.live_server is not None
+        assert window.status_ai.isVisible() and not dlg.live_button.isVisible()
+        assert Settings.get("mcp", "live_enabled")
+        reply = httpx.post(live_url(), timeout=30, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "insert_rows", "arguments": {"table": "customers", "rows": [{"name": "From AI"}]}}},
+            headers={"Authorization": f"Bearer {live_token()}", "Accept": "application/json, text/event-stream"})
+        assert reply.status_code == 200 and '"inserted": 1' in reply.json()["result"]["content"][0]["text"]
+        assert pump(qapp, lambda: window.act_write.isEnabled() and tab.model.total_rows() == 501)
+        assert isinstance(window.tabs.currentWidget(), TableTab)
+        window.write_changes()  # the user keeps the AI's change
+        con = sqlite3.connect(window.db.cur_file)
+        assert con.execute("SELECT COUNT(*) FROM customers WHERE name = 'From AI'").fetchone()[0] == 1
+        con.close()
+    finally:
+        window.act_live_ai.trigger()  # off again
+    assert window.live_server is None and not window.status_ai.isVisible()
+    assert not Settings.get("mcp", "live_enabled")
+
+
+def test_busy_prompt_never_aborts_an_ai_write(window, qapp, monkeypatch):
+    from sqliteview.mcp.session import AI_READING, AI_WRITING
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: asked.append(a) or QMessageBox.Yes))
+    assert window._ask_interrupt(AI_WRITING) is False and asked == []  # wait instead of rolling back
+    assert window._ask_interrupt(AI_READING) is True and len(asked) == 1  # a read may be stopped
+
+
+def test_live_ai_port_in_use(window, qapp):
+    import socket
+    from sqliteview.core.settings import Settings
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        Settings.set("mcp", "live_port", busy.getsockname()[1])
+        window.act_live_ai.trigger()
+    assert window.live_server is None and not window.act_live_ai.isChecked()
+    assert window.warnings and "Another SQliteView window" in window.warnings[-1][2]
+    assert not Settings.get("mcp", "live_enabled")
 
 
 def test_drop_and_revert(window, qapp):

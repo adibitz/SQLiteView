@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import errno
 import os
 from typing import Optional
 
@@ -21,6 +22,7 @@ from ..core import project as sqbpro
 from ..core import sqlb
 from ..core.db import DBBrowserDB
 from ..core.settings import Settings
+from ..mcp.session import AI_WRITING
 from .command_palette import CommandPalette, PaletteEntry
 from .db_info_tab import DbInfoTab
 from .explorer import SchemaExplorer
@@ -36,6 +38,7 @@ from .welcome import WelcomePage
 from .widgets import Toast, label, make_action
 
 DB_FILTER_ALL = "All files (*)"
+WSAEADDRINUSE = 10048  # Windows' "address already in use" (errno.EADDRINUSE is the C runtime's code there)
 
 
 class MainWindow(QMainWindow):
@@ -67,6 +70,8 @@ class MainWindow(QMainWindow):
         theme.changed.connect(self._on_theme_changed)
         self._restore_window()
         self._update_state()
+        if Settings.get("mcp", "live_enabled"):
+            QTimer.singleShot(0, lambda: self.set_live_ai(True, quiet=True))
 
     # ================================================================== construction
     def _build_actions(self) -> None:
@@ -120,6 +125,11 @@ class MainWindow(QMainWindow):
 
         self.act_about = A(self, "&About", "info", "", self.show_about)
         self.act_connect_ai = A(self, "Connect &AI Assistant…", "sparkle", "", self.show_connect_ai)
+        self.act_live_ai = A(self, "Allow &AI Assistants", "sparkle", "", self.set_live_ai, checkable=True,
+                             tip="Let Claude and other AI assistants work on the open database (their changes "
+                                 "stay unsaved until you press Write Changes)")
+        self.live_server = None  # sqliteview.mcp.live.LiveServer while live mode is on
+        self._live = None  # the LiveServer, once created
         self.act_shortcuts = A(self, "&Keyboard Shortcuts", "keyboard", "F1", self.show_shortcuts)
         self.act_theme_toggle = A(self, "Toggle Light/Dark Theme", "moon", "Ctrl+Shift+L", self.toggle_theme)
         self.act_full_screen = A(self, "Full Screen Table / Results", "maximize", "F11", self._toggle_current_full_screen)
@@ -373,6 +383,8 @@ class MainWindow(QMainWindow):
             m.addAction(a)
         m.addSeparator()
         m.addAction(self.act_load_ext)
+        m.addSeparator()
+        m.addAction(self.act_live_ai)
 
         m = mb.addMenu("&Help")
         m.addAction(self.act_connect_ai)
@@ -396,9 +408,12 @@ class MainWindow(QMainWindow):
         self.status_dirty.hide()
         self.status_ro = label("Read-only", "chip-danger")
         self.status_ro.hide()
+        self.status_ai = label("AI assistants on", "chip-accent")
+        self.status_ai.hide()
         self.status_encoding = label("", "faint")
         self.status_version = label(f"SQLite {DBBrowserDB.sqlite_version()}", "faint")
-        for w in (self.status_busy, self.status_dirty, self.status_ro, self.status_encoding, self.status_version):
+        for w in (self.status_busy, self.status_dirty, self.status_ai, self.status_ro, self.status_encoding,
+                  self.status_version):
             sb.addPermanentWidget(w)
 
     # ================================================================== helpers
@@ -408,6 +423,11 @@ class MainWindow(QMainWindow):
             self.toast.show_message(msg)
 
     def _ask_interrupt(self, user: str) -> bool:
+        if user == AI_WRITING:
+            # Interrupting a write makes SQLite roll back the whole transaction, the user's unsaved edits
+            # included: wait for the assistant's change to finish instead (the UI keeps responding meanwhile)
+            self.statusBar().showMessage("Waiting for the AI assistant to finish its change…", 3000)
+            return False
         r = QMessageBox.question(self, APP_DISPLAY_NAME,
                                  f"The database is currently busy: {user}\n\nDo you want to abort that other operation?",
                                  QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -1330,10 +1350,63 @@ class MainWindow(QMainWindow):
             "with a redesigned interface. The database engine logic follows the original C++ implementation.</p>"
             f"<p>SQLite {DBBrowserDB.sqlite_version()} · Qt {__import__('PySide6').QtCore.qVersion()}</p>")
 
+    # ================================================================== AI assistants (live MCP server)
+    def set_live_ai(self, on: bool, quiet: bool = False) -> None:
+        """Start or stop serving the open database to AI assistants (``quiet``: no dialogs, at start-up)."""
+        if not on:
+            self._stop_live_ai()
+            Settings.set("mcp", "live_enabled", False)
+            self.notify("AI assistants turned off")
+        elif self.live_server is None:
+            error = ""
+            try:
+                server = self._live_instance()
+                url = server.start()
+            except ImportError:
+                error = "The MCP server isn't installed. Run: pip install \"sqliteview[mcp]\""
+            except OSError as e:
+                error = f"Couldn't start the AI assistant server: {e}"
+                if e.errno in (errno.EADDRINUSE, WSAEADDRINUSE):
+                    error += ("\n\nAnother SQliteView window may already have it on; only one window can serve AI "
+                              "assistants at a time.")
+            if error:
+                if quiet:
+                    self.notify("AI assistants couldn't be turned on")
+                else:
+                    QMessageBox.warning(self, APP_DISPLAY_NAME, error)
+            else:
+                self.live_server = server
+                self.status_ai.setToolTip(f"Serving the open database to AI assistants at {url}")
+                Settings.set("mcp", "live_enabled", True)
+                if not quiet:
+                    self.notify("AI assistants can now work on the open database")
+        running = self.live_server is not None
+        self.act_live_ai.blockSignals(True)
+        self.act_live_ai.setChecked(running)
+        self.act_live_ai.blockSignals(False)
+        self.status_ai.setVisible(running)
+
+    def _live_instance(self):
+        """The window's one LiveServer (kept across off/on, so a request still finishing is reported as such)."""
+        if self._live is None:
+            from ..mcp.live import LiveServer
+            self._live = LiveServer(self.db, self)
+            self._live.changed.connect(self._on_ai_change)
+        return self._live
+
+    def _stop_live_ai(self) -> None:
+        if self.live_server is not None:
+            self.live_server.stop()
+            self.live_server = None
+
+    def _on_ai_change(self, description: str) -> None:
+        self._reload_table_tabs()
+        self.notify(f"AI assistant: {description} (not saved yet)")
+
     def show_connect_ai(self) -> None:
         from .dialogs.connect_ai import ConnectAiDialog
         database = self.db.cur_file if self.db.is_open() and self.db.cur_file != ":memory:" else None
-        ConnectAiDialog(database, bool(database) and self.db.read_only, self).exec()
+        ConnectAiDialog(database, bool(database) and self.db.read_only, self.act_live_ai, self).exec()
 
     def show_shortcuts(self) -> None:
         from .dialogs.misc import ShortcutsDialog
@@ -1402,7 +1475,12 @@ class MainWindow(QMainWindow):
                 if r == QMessageBox.Cancel or (r == QMessageBox.Save and not tab.save_file()):
                     e.ignore()
                     return
+        # Stop the AI first, so it can't stage changes while the user decides about the unsaved ones
+        live_was_on = self.live_server is not None
+        self._stop_live_ai()
         if not self._confirm_close_db():
+            if live_was_on:
+                self.set_live_ai(True, quiet=True)
             e.ignore()
             return
         Settings.set("MainWindow", "geometry", self.saveGeometry())
