@@ -19,6 +19,8 @@ from .session import (DEFAULT_ROW_LIMIT, DatabaseSession, ToolInputError, cell_v
 MAX_ROWS_PER_CALL = 5000
 SAMPLE_ROWS = 5
 STAGED_NOTE = "Staged, not saved yet: call commit_changes to write it to the file, or revert_changes to undo."
+LIVE_STAGED_NOTE = ("Shown in SQliteView but not saved yet: the user saves it with Write Changes or drops it "
+                    "with Revert Changes there.")
 _REFERENCES_RE = re.compile(r"^\s*([^()]+?)\s*(?:\(\s*([^()]*?)\s*\))?\s*$")
 
 
@@ -29,7 +31,8 @@ def _conflict(on_conflict: str) -> str:
 
 
 def staged_result(session: DatabaseSession, result: dict[str, Any]) -> dict[str, Any]:
-    result.update(uncommitted_changes=len(session.staged), note=STAGED_NOTE)
+    result.update(uncommitted_changes=len(session.staged),
+                  note=STAGED_NOTE if session.owns_db else LIVE_STAGED_NOTE)
     return result
 
 

@@ -41,7 +41,10 @@ def server_available() -> bool:
     return bool(getattr(sys, "frozen", False)) or importlib.util.find_spec("mcp") is not None
 
 
-def server_args(database: Optional[str] = None, read_only: bool = False) -> list[str]:
+def server_args(database: Optional[str] = None, read_only: bool = False, live: bool = False) -> list[str]:
+    """Arguments for the server: ``live`` connects to the running app's window instead of opening a file."""
+    if live:
+        return ["--live"]
     args = ["--db", database] if database else []
     return args + (["--read-only"] if read_only else [])
 

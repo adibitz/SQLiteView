@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 from typing import Annotated, Any, Callable, Literal, Optional, TypeVar, Union
@@ -24,22 +25,34 @@ from pydantic import Field
 from .. import APP_DISPLAY_NAME, __version__
 from . import editing, reading, schema, transfer
 from .models import ColumnSpec, RowFilter, SortKey
-from .session import (DEFAULT_ROW_LIMIT, MAX_ROW_LIMIT, QUERY_TIMEOUT_SECONDS, DatabaseSession, Sandbox,
-                      ToolInputError, describe_sqlite_error)
+from .session import (CLOSING_MESSAGE, DEFAULT_ROW_LIMIT, MAX_ROW_LIMIT, QUERY_TIMEOUT_SECONDS, DatabaseSession,
+                      Sandbox, ToolInputError, describe_sqlite_error)
 
 log = logging.getLogger("sqliteview.mcp")
 
-INSTRUCTIONS = f"""\
-{APP_DISPLAY_NAME} gives you a SQLite database.
+_READING_STEPS = f"""\
 1. Start with get_schema (all CREATE statements) or list_tables / describe_table.
 2. Read with filter_rows (one table: conditions, search, sort, paging, no SQL needed) or run_query (one read-only
    SQL statement: joins, GROUP BY, aggregates). Results are paged: at most {MAX_ROW_LIMIT} rows per call, use
    next_offset for more. explain_query checks a statement without running it.
+"""
+INSTRUCTIONS = f"""\
+{APP_DISPLAY_NAME} gives you a SQLite database.
+{_READING_STEPS}\
 3. Changes (insert_rows, update_rows, delete_rows, create_table, execute_sql, import_*) are staged, not saved:
    call commit_changes once the user is happy, or revert_changes to undo everything since the last commit.
    Use dry_run=true to preview updates, deletes and imports, and confirm destructive changes with the user.
 4. Rows are addressed by the _rowid_ column that filter_rows returns.
 5. Files (imports, exports, other databases) must be inside the folders list_database_files reports.
+"""
+LIVE_INSTRUCTIONS = f"""\
+You are connected to the database the user has open in {APP_DISPLAY_NAME} right now.
+{_READING_STEPS}\
+3. Changes (insert_rows, update_rows, delete_rows, create_table, execute_sql, import_*) appear in the app at once
+   but are not saved: the user saves them with Write Changes or drops them with Revert Changes there. Tell the user
+   what you changed. Use dry_run=true to preview updates, deletes and imports, and confirm destructive changes first.
+4. Rows are addressed by the _rowid_ column that filter_rows returns.
+5. Files (imports, exports) must be inside the folder of the open database.
 """
 
 READ = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
@@ -47,6 +60,9 @@ ADDS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=
 CHANGES = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 
 F = TypeVar("F", bound=Callable[..., Any])
+# Tool descriptions say "staged until commit_changes"; in live mode the user saves in the app instead
+_STAGED_RE = re.compile(r"[Ss]taged until commit_changes")
+LIVE_STAGED = "unsaved until the user presses Write Changes in SQliteView"
 
 Table = Annotated[str, Field(description="Table or view name (see list_tables)")]
 Limit = Annotated[int, Field(description=f"Rows per page (1–{MAX_ROW_LIMIT})")]
@@ -65,11 +81,16 @@ Overwrite = Annotated[bool, Field(description="Replace the file if it exists")]
 
 
 def build_server(session: DatabaseSession, log_level: str = "WARNING") -> FastMCP:
-    mcp = FastMCP(APP_DISPLAY_NAME, instructions=INSTRUCTIONS, log_level=log_level)
+    """The MCP server for ``session``. A session on the app's own database (live mode) gets no tools to open
+    databases or to commit/revert: the user decides that in the app."""
+    live = not session.owns_db
+    # Live mode is served over HTTP: one JSON reply per request, no per-client session state
+    mcp = FastMCP(APP_DISPLAY_NAME, instructions=LIVE_INSTRUCTIONS if live else INSTRUCTIONS, log_level=log_level,
+                  stateless_http=live, json_response=live)
 
-    def tool(annotations: ToolAnnotations, *, writes: bool = False) -> Callable[[F], F]:
-        """Register a tool (write tools only when the server isn't read-only) and turn engine errors
-        into messages the assistant can act on."""
+    def tool(annotations: ToolAnnotations, *, writes: bool = False, standalone: bool = False) -> Callable[[F], F]:
+        """Register a tool (write tools only when the server isn't read-only, ``standalone`` ones not in live
+        mode) and turn engine errors into messages the assistant can act on."""
         def register(fn: F) -> F:
             @functools.wraps(fn)
             def run(*args: Any, **kwargs: Any) -> Any:
@@ -78,21 +99,24 @@ def build_server(session: DatabaseSession, log_level: str = "WARNING") -> FastMC
                 except ToolInputError as e:
                     raise ToolError(str(e)) from e
                 except sqlite3.Error as e:
+                    if session.closing:
+                        raise ToolError(CLOSING_MESSAGE) from e
                     raise ToolError(describe_sqlite_error(e, session.query_timeout)) from e
-            if not (writes and session.read_only):
-                mcp.tool(annotations=annotations)(run)
+            if not (writes and session.read_only) and not (standalone and live):
+                description = _STAGED_RE.sub(LIVE_STAGED, fn.__doc__ or "") if live else None
+                mcp.tool(annotations=annotations, description=description)(run)
             return fn
         return register
 
     # ------------------------------------------------------------------ database & schema
-    @tool(ADDS)
+    @tool(ADDS, standalone=True)
     def open_database(path: Path, create: Annotated[bool, Field(description="Create the file if missing")] = False
                       ) -> dict[str, Any]:
         """Open (or create) a SQLite database file. The previous one must have no uncommitted changes."""
         session.open(path, create=create)
         return schema.database_info(session)
 
-    @tool(READ)
+    @tool(READ, standalone=True)
     def list_database_files() -> dict[str, Any]:
         """List the database files (.db, .sqlite, .sqlite3, .db3) in the folders this server may use."""
         return schema.list_database_files(session)
@@ -194,12 +218,12 @@ def build_server(session: DatabaseSession, log_level: str = "WARNING") -> FastMC
         """List the changes made since the last commit."""
         return editing.pending_changes(session)
 
-    @tool(CHANGES, writes=True)
+    @tool(CHANGES, writes=True, standalone=True)
     def commit_changes() -> dict[str, Any]:
         """Save all staged changes to the database file (like Write Changes in SQliteView). Ask the user first."""
         return editing.commit_changes(session)
 
-    @tool(CHANGES, writes=True)
+    @tool(CHANGES, writes=True, standalone=True)
     def revert_changes() -> dict[str, Any]:
         """Undo every change made since the last commit (like Revert Changes in SQliteView)."""
         return editing.revert_changes(session)
@@ -281,6 +305,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="sqliteview-mcp",
                                 description=f"{APP_DISPLAY_NAME} MCP server for Claude and other AI assistants "
                                             "(speaks MCP over stdin/stdout)")
+    p.add_argument("--live", action="store_true",
+                   help="connect to the database open in the SQliteView window (Tools › Allow AI Assistants) "
+                        "instead of opening one; the other options don't apply")
     p.add_argument("--db", metavar="FILE", help="database to open at start")
     p.add_argument("--create", action="store_true", help="create the --db file if it doesn't exist")
     p.add_argument("-R", "--read-only", action="store_true", help="open read-only and offer no edit/import tools")
@@ -327,6 +354,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
     app.setOrganizationName(ORG_NAME)
     app.setApplicationName(APP_NAME)
+    if args.live:
+        from .live import run_bridge
+        return run_bridge()
 
     session = DatabaseSession(Sandbox(allowed_roots(args.db, args.root)), read_only=args.read_only,
                               query_timeout=args.query_timeout)

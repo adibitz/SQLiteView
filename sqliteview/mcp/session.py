@@ -15,8 +15,9 @@ import os
 import sqlite3
 import sys
 import time
-from contextlib import contextmanager
-from typing import Any, Callable, Iterator, Optional
+from contextlib import closing, contextmanager
+from functools import lru_cache
+from typing import Any, Callable, Iterator, Optional, Union
 
 from ..core import sqlb
 from ..core.db import DBBrowserDB, _text_factory_fallback
@@ -30,6 +31,11 @@ BLOB_PREVIEW_BYTES = 32
 QUERY_TIMEOUT_SECONDS = 30.0
 DATABASE_EXTENSIONS = (".db", ".sqlite", ".sqlite3", ".db3")
 PROGRESS_HANDLER_STEPS = 10_000
+# Who holds the engine lock, as the app's "database is busy" prompt shows it
+AI_READING = "AI assistant (reading)"
+AI_WRITING = "AI assistant (writing)"
+CLOSING_MESSAGE = "SQliteView stopped serving AI assistants."
+ROOT_HINT = "Ask the user to add the folder with --root in the MCP server configuration."
 
 # Pragmas that only report something, also when given an argument (e.g. table_info(t))
 QUERY_PRAGMAS = frozenset({
@@ -44,6 +50,7 @@ READABLE_PRAGMAS = frozenset({
     "case_sensitive_like", "synchronous", "temp_store", "max_page_count", "secure_delete",
 })
 BLOCKED_FUNCTIONS = frozenset({"load_extension"})
+ENGINE_FUNCTIONS = frozenset({"regexp", "sqlb_make_single_value"})  # registered by DBBrowserDB
 _SQLITE_RECURSIVE = getattr(sqlite3, "SQLITE_RECURSIVE", 33)
 _READ_ACTIONS = frozenset({sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, _SQLITE_RECURSIVE})
 _NEVER_IN_WRITES = frozenset({sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_TRANSACTION,
@@ -56,34 +63,65 @@ class ToolInputError(ValueError):
 
 # --------------------------------------------------------------------------- authorizers
 
-def _shared_rules(action: int, arg1: Optional[str], arg2: Optional[str]) -> Optional[int]:
-    if action == sqlite3.SQLITE_FUNCTION:
-        return sqlite3.SQLITE_DENY if (arg2 or "").lower() in BLOCKED_FUNCTIONS else sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_PRAGMA:
-        name = (arg1 or "").lower()
-        if name in QUERY_PRAGMAS or (name in READABLE_PRAGMAS and arg2 is None):
+@lru_cache(maxsize=1)
+def builtin_functions() -> frozenset[str]:
+    """SQL functions of SQLite itself plus the engine's own. Functions added by extensions (readfile, writefile,
+    … which the app may have loaded from its settings) aren't in it. Empty when SQLite can't list them."""
+    with closing(sqlite3.connect(":memory:")) as conn:
+        try:
+            names = {row[0].lower() for row in conn.execute("PRAGMA function_list")}
+        except sqlite3.Error:
+            log.warning("this SQLite can't list its functions; only load_extension() is blocked")
+            return frozenset()
+    return frozenset(names | ENGINE_FUNCTIONS) - BLOCKED_FUNCTIONS
+
+
+@lru_cache(maxsize=1)
+def builtin_modules() -> frozenset[str]:
+    """Virtual-table modules of SQLite itself (json_each, pragma_* …)."""
+    with closing(sqlite3.connect(":memory:")) as conn:
+        try:
+            return frozenset(row[0].lower() for row in conn.execute("PRAGMA module_list"))
+        except sqlite3.Error:
+            return frozenset()
+
+
+def extension_modules(conn: sqlite3.Connection) -> frozenset[str]:
+    """Virtual-table modules an extension added to ``conn`` (e.g. fsdir), which the assistant may not use."""
+    try:
+        return frozenset(row[0].lower() for row in conn.execute("PRAGMA module_list")) - builtin_modules()
+    except sqlite3.Error:
+        return frozenset()
+
+
+def make_authorizer(writes: bool, foreign_modules: frozenset[str] = frozenset()) -> Callable[..., int]:
+    """An SQLite authorizer for statements from the assistant. Read mode allows SELECT-type statements only.
+    Write mode allows data and schema changes, but no ATTACH/DETACH, transaction control or pragma changes
+    (those would escape the savepoint or the folder sandbox). Both refuse functions and virtual tables that
+    don't come with SQLite, so loaded extensions can't reach the file system."""
+    functions = builtin_functions()
+
+    def authorize(action: int, arg1: Optional[str], arg2: Optional[str], _db: Optional[str],
+                  _trigger: Optional[str]) -> int:
+        if action == sqlite3.SQLITE_FUNCTION:
+            name = (arg2 or "").lower()
+            if name in BLOCKED_FUNCTIONS or (functions and name not in functions):
+                return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
-        return sqlite3.SQLITE_DENY
-    return None
+        if action == sqlite3.SQLITE_PRAGMA:
+            name = (arg1 or "").lower()
+            if name in QUERY_PRAGMAS or (name in READABLE_PRAGMAS and arg2 is None):
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+        if foreign_modules and (
+                (action == sqlite3.SQLITE_READ and (arg1 or "").lower() in foreign_modules)
+                or (action == sqlite3.SQLITE_CREATE_VTABLE and (arg2 or "").lower() in foreign_modules)):
+            return sqlite3.SQLITE_DENY
+        if writes:
+            return sqlite3.SQLITE_DENY if action in _NEVER_IN_WRITES else sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_OK if action in _READ_ACTIONS else sqlite3.SQLITE_DENY
 
-
-def read_authorizer(action: int, arg1: Optional[str], arg2: Optional[str], _db: Optional[str],
-                    _trigger: Optional[str]) -> int:
-    """Allows SELECT-type statements only."""
-    shared = _shared_rules(action, arg1, arg2)
-    if shared is not None:
-        return shared
-    return sqlite3.SQLITE_OK if action in _READ_ACTIONS else sqlite3.SQLITE_DENY
-
-
-def write_authorizer(action: int, arg1: Optional[str], arg2: Optional[str], _db: Optional[str],
-                     _trigger: Optional[str]) -> int:
-    """Allows data and schema changes, but no ATTACH/DETACH, transaction control, pragma changes or
-    extension loading (those would escape the savepoint or the folder sandbox)."""
-    shared = _shared_rules(action, arg1, arg2)
-    if shared is not None:
-        return shared
-    return sqlite3.SQLITE_DENY if action in _NEVER_IN_WRITES else sqlite3.SQLITE_OK
+    return authorize
 
 
 def describe_sqlite_error(e: sqlite3.Error, timeout: float = QUERY_TIMEOUT_SECONDS) -> str:
@@ -92,8 +130,10 @@ def describe_sqlite_error(e: sqlite3.Error, timeout: float = QUERY_TIMEOUT_SECON
     low = msg.lower()
     if "not authorized" in low:
         return ("SQLite refused this statement (not authorized). Through this connection you can't ATTACH/DETACH "
-                "databases, change PRAGMA settings, use BEGIN/COMMIT/ROLLBACK/SAVEPOINT or load extensions; "
-                "use commit_changes / revert_changes to end a change. Read tools only accept reading statements.")
+                "databases, change PRAGMA settings, use BEGIN/COMMIT/ROLLBACK/SAVEPOINT, load extensions, or use "
+                "functions and virtual tables that aren't part of SQLite, also not through a view or trigger that "
+                "calls them (e.g. functions of an extension loaded in SQliteView). Read tools only accept reading "
+                f"statements. SQLite said: {msg}")
     if "interrupted" in low:
         return f"The statement was stopped after {timeout:g} seconds. Narrow it down (WHERE, LIMIT) and try again."
     if "database is locked" in low or "database is busy" in low:
@@ -171,10 +211,20 @@ def _inside(path: str, root: str) -> bool:
 class Sandbox:
     """The folders the server may read and write files in (databases, CSV/JSON/SQL files)."""
 
-    def __init__(self, roots: list[str]):
-        if not roots:
+    def __init__(self, roots: Union[list[str], Callable[[], list[str]]], hint: str = ROOT_HINT):
+        """``roots``: the folders, or a function returning them (live mode follows the database the app has
+        open). ``hint`` tells the assistant how to get access to other folders."""
+        if not callable(roots) and not roots:
             raise ValueError("at least one root folder is needed")
-        self.roots = [os.path.realpath(os.path.abspath(r)) for r in roots]
+        self._roots = roots
+        self.hint = hint
+
+    @property
+    def roots(self) -> list[str]:
+        roots = self._roots() if callable(self._roots) else self._roots
+        if not roots:
+            raise ToolInputError("No folder is available for files yet; open a database first.")
+        return [os.path.realpath(os.path.abspath(r)) for r in roots]
 
     def resolve(self, path: str, *, must_exist: bool = False) -> str:
         """Absolute real path of ``path`` (relative paths start at the first root); raises
@@ -183,13 +233,14 @@ class Sandbox:
             raise ToolInputError("The path is empty.")
         if _is_device_name(path.strip()):
             raise ToolInputError(f"{path} is a Windows device name, not a file.")
+        roots = self.roots
         expanded = os.path.expanduser(path.strip())
         if not os.path.isabs(expanded):
-            expanded = os.path.join(self.roots[0], expanded)
+            expanded = os.path.join(roots[0], expanded)
         full = os.path.realpath(expanded)
-        if not any(_inside(full, r) for r in self.roots):
-            raise ToolInputError(f"{path} is outside the folders this server may use ({', '.join(self.roots)}). "
-                                 "Ask the user to add the folder with --root in the MCP server configuration.")
+        if not any(_inside(full, r) for r in roots):
+            raise ToolInputError(f"{path} is outside the folders this server may use ({', '.join(roots)}). "
+                                 + self.hint)
         if must_exist and not os.path.exists(full):
             raise ToolInputError(f"File not found: {full}")
         return full
@@ -208,11 +259,17 @@ class Sandbox:
 # --------------------------------------------------------------------------- session
 
 class DatabaseSession:
-    def __init__(self, sandbox: Sandbox, read_only: bool = False, query_timeout: float = QUERY_TIMEOUT_SECONDS):
+    def __init__(self, sandbox: Sandbox, read_only: bool = False, query_timeout: float = QUERY_TIMEOUT_SECONDS,
+                 db: Optional[DBBrowserDB] = None, on_change: Optional[Callable[[str], None]] = None):
+        """``db``: an engine owned by someone else (live mode: the app window's); the session then never opens,
+        closes or reverts it. ``on_change(description)`` is called after each staged change."""
         self.sandbox = sandbox
         self.read_only = read_only
         self.query_timeout = query_timeout
-        self.db = DBBrowserDB()
+        self.owns_db = db is None
+        self.db = DBBrowserDB() if db is None else db
+        self.on_change = on_change
+        self.closing = False  # set when the server stops: reads end at once, no new changes start
         self.staged: list[str] = []
         self._schema_version: Any = None
 
@@ -222,6 +279,8 @@ class DatabaseSession:
         return self.db.cur_file if self.db.is_open() else ""
 
     def open(self, path: str, create: bool = False) -> None:
+        if not self.owns_db:
+            raise ToolInputError("This server works on the database open in SQliteView; open another one there.")
         full = self.sandbox.resolve(path, must_exist=not create)
         if self.db.is_open() and self.db.dirty:
             raise ToolInputError(f"{self.path} has uncommitted changes. Call commit_changes or revert_changes first.")
@@ -247,6 +306,9 @@ class DatabaseSession:
         log.info("opened %s%s", full, " (read-only)" if self.db.read_only else "")
 
     def close(self) -> None:
+        if not self.owns_db:  # the app keeps the database and decides about its uncommitted changes
+            self.staged.clear()
+            return
         if not self.db.is_open():
             return
         if self.db.dirty:
@@ -261,11 +323,15 @@ class DatabaseSession:
     def require_open(self) -> DBBrowserDB:
         """The open database, with the schema re-read if another program changed it."""
         if not self.db.is_open():
+            if not self.owns_db:
+                raise ToolInputError("No database is open in SQliteView. Ask the user to open one.")
             raise ToolInputError("No database is open. Call open_database first (list_database_files shows the "
                                  "files you can open).")
         lost = self._forget_lost_transaction()
         if lost:
             log.warning("SQLite rolled back the transaction; lost: %s", "; ".join(lost))
+        if self.staged and not self.db.dirty:
+            self.staged.clear()  # written or reverted in SQliteView (live mode)
         version = self._read_schema_version()
         if version != self._schema_version:
             self.db.update_schema()
@@ -321,12 +387,16 @@ class DatabaseSession:
 
     # ------------------------------------------------------------------ guarded access
     @contextmanager
-    def _guarded(self, authorizer: Callable[..., int], timeout: bool = True) -> Iterator[sqlite3.Connection]:
-        with self.db.exclusive("AI assistant") as conn:
-            conn.set_authorizer(authorizer)
-            if timeout:
-                deadline = time.monotonic() + self.query_timeout
-                conn.set_progress_handler(lambda: int(time.monotonic() > deadline), PROGRESS_HANDLER_STEPS)
+    def _guarded(self, writes: bool, timeout: bool = True) -> Iterator[sqlite3.Connection]:
+        with self.db.exclusive(AI_WRITING if writes else AI_READING) as conn:
+            if conn is None:  # closed in the app (live mode) since the check
+                raise ToolInputError("The database was closed.")
+            conn.set_authorizer(make_authorizer(writes, extension_modules(conn)))
+            deadline = time.monotonic() + self.query_timeout if timeout else math.inf
+            # Reads also stop when the session closes; writes run to the end, since interrupting one makes SQLite
+            # roll back the whole transaction (with any unsaved edits of the user in live mode)
+            conn.set_progress_handler(lambda: int(time.monotonic() > deadline or (self.closing and not writes)),
+                                      PROGRESS_HANDLER_STEPS)
             conn.text_factory = _text_factory_fallback
             try:
                 yield conn
@@ -340,14 +410,14 @@ class DatabaseSession:
         """The connection, allowed to run reading statements only (``timeout=False`` for whole-table exports,
         which may legitimately take long)."""
         self.require_open()
-        with self._guarded(read_authorizer, timeout) as conn:
+        with self._guarded(False, timeout) as conn:
             yield conn
 
     @contextmanager
     def explaining(self) -> Iterator[sqlite3.Connection]:
         """The connection for EXPLAIN of any statement (EXPLAIN never runs it)."""
         self.require_open()
-        with self._guarded(write_authorizer) as conn:
+        with self._guarded(True) as conn:
             yield conn
 
     @contextmanager
@@ -355,48 +425,56 @@ class DatabaseSession:
         """A change of the engine's own making in its own savepoint: kept (uncommitted) when the
         block succeeds, rolled back when it raises or when ``dry_run`` is set."""
         db = self.require_writable()
-        savepoint = db.generate_savepoint_name("mcp")
-        if not db.set_savepoint(savepoint):
-            raise ToolInputError(f"Couldn't start the change: {db.last_error}")
-        try:
-            yield db
-        except BaseException as e:
-            lost = self._forget_lost_transaction()
-            if lost is not None:
-                earlier = "; ".join(lost) if lost else "none"
-                raise ToolInputError(f"{e}\nSQLite rolled back the whole transaction, not just this change, so all "
-                                     f"uncommitted changes were lost (earlier changes: {earlier}). The database is as "
-                                     "it was at the last commit_changes.") from e
-            db.revert_to_savepoint(savepoint)
-            self.schema_changed()  # the rolled-back statements may have been DDL
-            raise
-        if dry_run:
-            db.revert_to_savepoint(savepoint)
-            self.schema_changed()
-        else:
-            self.staged.append(description)
+        if self.closing:
+            raise ToolInputError(CLOSING_MESSAGE)
+        # One lock for the whole change: Write/Revert Changes in the app (live mode) can't land in the middle of it
+        with db.exclusive(AI_WRITING):
+            savepoint = db.generate_savepoint_name("mcp")
+            if not db.set_savepoint(savepoint):
+                raise ToolInputError(f"Couldn't start the change: {db.last_error}")
+            try:
+                yield db
+            except BaseException as e:
+                lost = self._forget_lost_transaction()
+                if lost is not None:
+                    earlier = "; ".join(lost) if lost else "none"
+                    also = "" if self.owns_db else ", including unsaved edits made in SQliteView"
+                    raise ToolInputError(f"{e}\nSQLite rolled back the whole transaction, not just this change, so "
+                                         f"all uncommitted changes were lost{also} (earlier changes: {earlier}). The "
+                                         "database is as it was when changes were last written.") from e
+                db.revert_to_savepoint(savepoint)
+                self.schema_changed()  # the rolled-back statements may have been DDL
+                raise
+            if dry_run:
+                db.revert_to_savepoint(savepoint)
+                self.schema_changed()
+            else:
+                self.staged.append(description)
+                if self.on_change is not None:
+                    self.on_change(description)
 
     @contextmanager
     def writing(self, description: str, dry_run: bool = False) -> Iterator[sqlite3.Connection]:
         """Like :meth:`staging`, for SQL written by the assistant (runs under the write authorizer)."""
-        with self.staging(description, dry_run), self._guarded(write_authorizer) as conn:
+        with self.staging(description, dry_run), self._guarded(True) as conn:
             yield conn
 
     # ------------------------------------------------------------------ transaction
     def _in_transaction(self) -> bool:
-        with self.db.exclusive("MCP") as conn:
+        with self.db.exclusive(AI_READING) as conn:
             return conn is not None and conn.in_transaction
 
     def _forget_lost_transaction(self) -> Optional[list[str]]:
         """SQLite ends the whole transaction (not just a savepoint) when a write is interrupted, on ON CONFLICT
         ROLLBACK and on RAISE(ROLLBACK). Then the savepoints the engine tracks no longer exist: forget them and
         return the staged changes that were lost. None when the transaction is intact."""
-        if not self.db.savepoints or self._in_transaction():
-            return None
-        lost = list(self.staged)
-        self.db.savepoints.clear()
+        with self.db.exclusive(AI_WRITING):  # the app may write or revert at the same time (live mode)
+            if not self.db.savepoints or self._in_transaction():
+                return None
+            lost = list(self.staged)
+            self.db.savepoints.clear()
+            self.staged.clear()
         self.db.dbChanged.emit(False)
-        self.staged.clear()
         self.schema_changed()
         return lost
 
