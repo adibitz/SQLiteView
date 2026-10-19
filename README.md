@@ -3,17 +3,34 @@
 SQliteView is a Python / Qt for Python (PySide6) port of [DB Browser for SQLite](https://github.com/sqlitebrowser/sqlitebrowser)
 with a redesigned interface. The database engine behaviour follows the original C++ code; the UI and UX are new.
 
-```
-python -m pip install -r requirements.txt
-python main.py                      # start page
-python main.py my.db                # open a database
-python main.py db.sqlite -R         # read-only
-python main.py db.sqlite -t users   # open and browse a table
-python main.py db.sqlite -s q.sql   # open (and run) a SQL file
-python main.py work.sqbpro          # open a project (database, tabs, filters, layout)
-```
+## Download
 
-`scripts/make_demo_db.py PATH` builds the sample database the tests use.
+Ready-to-run builds for **Windows**, **macOS** and **Linux** are attached to each
+[GitHub release](https://github.com/adibitz/SQLiteView/releases). No Python needed.
+
+| Platform | File | How to run |
+|---|---|---|
+| Windows 10/11 (x64) | `SQliteView-<version>-windows-x64-setup.exe` | Run the installer (optionally associates .db/.sqlite files). |
+| | `SQliteView-<version>-windows-x64.zip` | Portable: unzip anywhere and run `SQliteView.exe`. |
+| macOS 11+ (Apple silicon / Intel) | `SQliteView-<version>-macos-arm64.dmg` / `-macos-x64.dmg` | Open the DMG and drag SQliteView to Applications. |
+| Linux x86_64 (glibc 2.35+) | `SQliteView-<version>-linux-x86_64.AppImage` | `chmod +x SQliteView-*.AppImage` then run it. |
+| | `SQliteView-<version>-linux-x86_64.tar.gz` | Extract and run `SQliteView/SQliteView`. |
+
+The builds aren't code-signed yet. On Windows, SmartScreen may say "Windows protected your PC": choose
+**More info › Run anyway**. On macOS, the first time, right-click the app and choose **Open** (or run
+`xattr -dr com.apple.quarantine /Applications/SQliteView.app`). Some Linux distributions need `libxcb-cursor0`
+(`sudo apt install libxcb-cursor0`) and, for the AppImage, `libfuse2`.
+
+### Command line
+
+```
+sqliteview                      # start page          (python main.py … when running from source)
+sqliteview my.db                # open a database
+sqliteview db.sqlite -R         # read-only
+sqliteview db.sqlite -t users   # open and browse a table
+sqliteview db.sqlite -s q.sql   # open (and run) a SQL file;  add -q to quit afterwards
+sqliteview work.sqbpro          # open a project (database, tabs, filters, layout)
+```
 
 ## What's new in the UI
 
@@ -67,8 +84,18 @@ app/
       theme.py (tokens + QSS), icons.py (inline SVG), widgets.py (design-system components)
       dialogs/               edit_table, edit_index, import_csv, export_data, export_sql,
                              add_record, preferences, display_format, cond_format, misc
+    assets/                  bundled DM Sans font (+ OFL licence) and app icons
   tests/                     engine + UI tests (run offscreen)
-  scripts/make_demo_db.py
+  scripts/
+    build.py                 build + package for the current OS (PyInstaller)
+    make_icons.py            regenerate assets/icons from the vector glyph (needs Pillow)
+    make_demo_db.py          sample database used by the tests
+  packaging/
+    sqliteview.spec          PyInstaller spec (one-folder build, macOS .app bundle)
+    windows/sqliteview.iss   Inno Setup installer
+    linux/sqliteview.desktop desktop entry (tarball / AppImage)
+  .github/workflows/release.yml   CI: tests + Windows/macOS/Linux builds, releases on tags
+  pyproject.toml             package metadata, dependencies, `sqliteview` command
 ```
 
 ### Engine behaviour kept from the original
@@ -122,15 +149,126 @@ hot spots if profiling shows a need; no compiler was available when this port wa
 * Project files don't store the Explorer's expanded items or per-table encodings, hidden columns, display/conditional
   formats and plot settings (upstream files that contain them still open; those parts are ignored)
 
-## Tests
+## Installation for developers
 
-```
-python -m pip install pytest
-python -m pytest tests -q
+You need **Python 3.10+** (3.12 recommended) and **git**. PySide6 ships its own Qt, so nothing else is needed on
+Windows and macOS. On Linux, install Qt's system libraries first:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libfontconfig1
+# Fedora
+sudo dnf install mesa-libEGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms fontconfig
 ```
 
-Tests run with `QT_QPA_PLATFORM=offscreen` and a temporary settings file, so they never touch your real settings.
+1. Clone the repository
+
+   ```bash
+   git clone https://github.com/adibitz/SQLiteView.git
+   cd SQLiteView
+   ```
+
+2. Create and activate a virtual environment
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate        # macOS / Linux
+   .venv\Scripts\activate           # Windows (PowerShell: .venv\Scripts\Activate.ps1)
+   ```
+
+3. Install the app in editable mode with the developer tools (pytest, PyInstaller, Pillow)
+
+   ```bash
+   python -m pip install --upgrade pip
+   python -m pip install -e ".[dev]"
+   ```
+
+   Only want to run it? `python -m pip install -r requirements.txt` installs just PySide6.
+
+4. Run it
+
+   ```bash
+   sqliteview            # the command installed in step 3
+   python main.py        # same thing, straight from the source tree
+   ```
+
+   To try it with sample data: `python scripts/make_demo_db.py demo.db` then `sqliteview demo.db`
+   (`*.db` files are git-ignored).
+
+5. Run the tests
+
+   ```bash
+   python -m pytest -q
+   ```
+
+   Tests run with `QT_QPA_PLATFORM=offscreen` and a temporary settings file, so they open no windows and never
+   touch your real settings.
+
+### Project layout and conventions
+
+* `sqliteview/core` is the engine and must not import widgets; `sqliteview/ui` is everything Qt Widgets.
+* Colours, spacing and fonts come from the design tokens in `ui/theme.py`; icons from `ui/icons.py`; reusable
+  controls from `ui/widgets.py`. Use those rather than hard-coding styles.
+* Settings and their defaults live in `core/settings.py` (stored with `QSettings` under the name `sqliteview`).
+* The version is `__version__` in `sqliteview/__init__.py`; `pyproject.toml`, the PyInstaller spec, the build
+  script and the installer all read it from there.
+
+## Building distributable packages
+
+Packages are built with [PyInstaller](https://pyinstaller.org). It can't cross-compile, so each platform's package
+is built on that platform — locally, or by CI for all three at once.
+
+### Locally (current OS)
+
+```bash
+python -m pip install -e ".[dev]"
+python scripts/build.py
+```
+
+Everything lands in `dist/`:
+
+| OS | Output | Extra tool (optional) |
+|---|---|---|
+| Windows | `SQliteView-<ver>-windows-x64.zip` (portable) and `…-setup.exe` | [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer (`iscc` on PATH or in Program Files) |
+| macOS | `SQliteView-<ver>-macos-<arch>.dmg` and `.zip` with `SQliteView.app` | none (`hdiutil` and `ditto` ship with macOS) |
+| Linux | `SQliteView-<ver>-linux-<arch>.tar.gz` and `.AppImage` | [appimagetool](https://github.com/AppImage/appimagetool) on PATH or in `$APPIMAGETOOL` |
+
+The unpacked app is in `dist/SQliteView/` (`dist/SQliteView.app` on macOS) if you want to try it before
+packaging. `python scripts/build.py --skip-bundle` re-packages an existing build without running PyInstaller again.
+Build Linux packages on the oldest distribution you want to support (the app needs that glibc or newer).
+
+### With GitHub Actions (all platforms)
+
+`.github/workflows/release.yml` runs on every push and pull request to `main`: it runs the tests, then builds
+Windows x64, macOS arm64, macOS x64 and Linux x86_64 packages. Download them from the workflow run's
+**Artifacts** section.
+
+### Making a release
+
+1. Bump `__version__` in `sqliteview/__init__.py` and commit.
+2. Tag and push:
+
+   ```bash
+   git tag v0.2.0
+   git push origin main --tags
+   ```
+
+3. The workflow builds every package and publishes a GitHub Release for the tag with all files attached and
+   generated release notes.
+
+### Signing (not set up yet)
+
+The builds are unsigned. For signed releases add a Windows code-signing certificate (`signtool` after the
+PyInstaller step and on the installer) and, on macOS, a Developer ID certificate with `codesign --deep` plus
+`xcrun notarytool` before creating the DMG. Store the certificates as GitHub Actions secrets.
+
+### App icons
+
+The icons in `sqliteview/assets/icons/` (PNG, `.ico`, `.icns`) are generated from the vector glyph in
+`ui/icons.py` by `python scripts/make_icons.py` (needs Pillow, included in `.[dev]`). Commit the regenerated files.
 
 ## License
 
 Like the original, this port is available under the GPL-3.0 / MPL-2.0 dual license of DB Browser for SQLite.
+The bundled DM Sans font is licensed under the SIL Open Font License 1.1 (`sqliteview/assets/fonts/OFL.txt`).
+Distributed packages include Qt for Python (PySide6, LGPLv3).

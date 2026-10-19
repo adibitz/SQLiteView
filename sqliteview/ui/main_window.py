@@ -24,7 +24,7 @@ from ..core.settings import Settings
 from .command_palette import CommandPalette, PaletteEntry
 from .db_info_tab import DbInfoTab
 from .explorer import SchemaExplorer
-from .icons import bind_icon, icon, refresh_bound_icons
+from .icons import app_icon, bind_icon, icon, refresh_bound_icons
 from .inspector import CellInspector
 from .log_panel import LogPanel
 from .plot_dock import PlotPanel
@@ -47,7 +47,7 @@ class MainWindow(QMainWindow):
         self.db.warning_handler = lambda msg: QMessageBox.warning(self, APP_DISPLAY_NAME, msg)
         self.project_path = ""  # current .sqbpro file, if the database was opened from or saved to one
         self.setWindowTitle(APP_DISPLAY_NAME)
-        self.setWindowIcon(icon("database", "accent"))
+        self.setWindowIcon(app_icon())
         self.setAcceptDrops(True)
         self.setDockNestingEnabled(True)
         self.resize(1360, 860)

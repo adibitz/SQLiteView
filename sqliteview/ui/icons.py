@@ -138,6 +138,18 @@ def icon(name: str, color: str | None = None) -> QIcon:
 
 ICON_SIZE = QSize(16, 16)
 
+APP_ICON_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icons")
+
+
+def app_icon() -> QIcon:
+    """The application icon (window, taskbar, dock); falls back to a drawn glyph."""
+    ic = QIcon()
+    for name in ("sqliteview.png", "sqliteview-512.png", "sqliteview-1024.png"):
+        path = os.path.join(APP_ICON_DIR, name)
+        if os.path.exists(path):
+            ic.addFile(path)
+    return ic if not ic.isNull() else icon("database", "accent")
+
 _qss_dir: str | None = None
 
 

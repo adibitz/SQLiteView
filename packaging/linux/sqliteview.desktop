@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SQliteView
+GenericName=SQLite Database Browser
+Comment=Browse, edit and query SQLite databases
+Exec=sqliteview %f
+Icon=sqliteview
+Terminal=false
+Categories=Development;Database;
+Keywords=sqlite;database;sql;browser;editor;
+MimeType=application/vnd.sqlite3;application/x-sqlite3;
+StartupWMClass=sqliteview

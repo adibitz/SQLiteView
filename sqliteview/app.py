@@ -45,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sqlb.set_identifier_quoting(sqlb.EscapeQuoting(int(Settings.get("editor", "identifier_quotes"))))
     theme.apply()
+    from .ui.icons import app_icon
+    app.setWindowIcon(app_icon())
+    app.setDesktopFileName("sqliteview")  # matches packaging/linux/sqliteview.desktop (taskbar icon on Wayland)
     # Follow the OS light/dark switch when the theme is set to "system"
     try:
         QGuiApplication.styleHints().colorSchemeChanged.connect(
