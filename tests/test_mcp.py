@@ -447,3 +447,21 @@ def test_stdio_program_bad_database(workdir):
     proc = subprocess.run([sys.executable, "-m", "sqliteview.mcp", "--db", str(workdir / "missing.db")],
                           capture_output=True, timeout=60, env=env, input=b"")
     assert proc.returncode == 2 and b"File not found" in proc.stderr and proc.stdout == b""
+
+
+# ---------------------------------------------------------------------------- client configuration
+
+def test_client_config_snippets(tmp_path):
+    from sqliteview.mcp.clientconfig import CLIENTS, server_args, server_available, server_command
+    cmd = server_command()
+    assert cmd and server_available()
+    args = server_args(str(tmp_path / "my shop.db"), read_only=True)
+    assert args == ["--db", str(tmp_path / "my shop.db"), "--read-only"] and server_args() == []
+    by_name = {c.name: c for c in CLIENTS}
+    desktop = json.loads(by_name["Claude Desktop"].snippet(cmd, args))["mcpServers"]["sqliteview"]
+    assert desktop == {"command": cmd[0], "args": cmd[1:] + args}
+    vscode = json.loads(by_name["VS Code"].snippet(cmd, args))["servers"]["sqliteview"]
+    assert vscode["type"] == "stdio" and vscode["args"][-1] == "--read-only"
+    claude_code = by_name["Claude Code"].snippet(["C:/Program Files/SQliteView/sqliteview-mcp.exe"], args)
+    assert claude_code.startswith("claude mcp add sqliteview -- ") and "my shop.db" in claude_code
+    assert "claude_desktop_config.json" in by_name["Claude Desktop"].where

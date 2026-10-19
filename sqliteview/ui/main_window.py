@@ -119,6 +119,7 @@ class MainWindow(QMainWindow):
         self.act_load_ext = A(self, "&Load Extension…", "wrench", "", self.load_extension)
 
         self.act_about = A(self, "&About", "info", "", self.show_about)
+        self.act_connect_ai = A(self, "Connect &AI Assistant…", "sparkle", "", self.show_connect_ai)
         self.act_shortcuts = A(self, "&Keyboard Shortcuts", "keyboard", "F1", self.show_shortcuts)
         self.act_theme_toggle = A(self, "Toggle Light/Dark Theme", "moon", "Ctrl+Shift+L", self.toggle_theme)
         self.act_full_screen = A(self, "Full Screen Table / Results", "maximize", "F11", self._toggle_current_full_screen)
@@ -374,6 +375,8 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_load_ext)
 
         m = mb.addMenu("&Help")
+        m.addAction(self.act_connect_ai)
+        m.addSeparator()
         m.addAction(self.act_shortcuts)
         m.addAction(self.act_about)
 
@@ -1326,6 +1329,11 @@ class MainWindow(QMainWindow):
             "<p>A Python/Qt for Python port of <a href='https://sqlitebrowser.org'>DB Browser for SQLite</a> "
             "with a redesigned interface. The database engine logic follows the original C++ implementation.</p>"
             f"<p>SQLite {DBBrowserDB.sqlite_version()} · Qt {__import__('PySide6').QtCore.qVersion()}</p>")
+
+    def show_connect_ai(self) -> None:
+        from .dialogs.connect_ai import ConnectAiDialog
+        database = self.db.cur_file if self.db.is_open() and self.db.cur_file != ":memory:" else None
+        ConnectAiDialog(database, bool(database) and self.db.read_only, self).exec()
 
     def show_shortcuts(self) -> None:
         from .dialogs.misc import ShortcutsDialog

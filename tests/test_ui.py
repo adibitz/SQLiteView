@@ -193,6 +193,22 @@ def test_import_csv_dialog(window, qapp, tmp_path):
     assert window.db.query_single_value("SELECT COUNT(*) FROM visits") == 4
 
 
+def test_connect_ai_dialog(window, qapp):
+    from sqliteview.mcp.clientconfig import CLIENTS
+    from sqliteview.ui.dialogs.connect_ai import ConnectAiDialog
+    assert window.act_connect_ai.isEnabled()
+    dlg = ConnectAiDialog(window.db.cur_file, False, window)
+    assert json.loads(dlg.snippet.toPlainText())["mcpServers"]["sqliteview"]["args"][-2:] == ["--db", window.db.cur_file]
+    dlg.read_only.setChecked(True)
+    dlg.clients.button(1).click()
+    assert dlg.snippet.toPlainText().startswith("claude mcp add") and "--read-only" in dlg.snippet.toPlainText()
+    assert dlg.where.text() == CLIENTS[1].where
+    dlg.use_db.setChecked(False)
+    assert "--db" not in dlg.snippet.toPlainText()
+    dlg.copy()
+    assert QGuiApplication.clipboard().text() == dlg.snippet.toPlainText()
+
+
 def test_drop_and_revert(window, qapp):
     window.open_table(sqlb.ObjectIdentifier("main", "orders"))
     window.drop_object("table", sqlb.ObjectIdentifier("main", "orders"))
