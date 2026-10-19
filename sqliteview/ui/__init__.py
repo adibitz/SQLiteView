@@ -1,0 +1,1 @@
+"""Widgets layer (PySide6)."""
